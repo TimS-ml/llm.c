@@ -1,209 +1,531 @@
 /*
-GPT-2 Transformer Neural Net training loop. See README.md for usage.
+==============================================================================
+GPT-2 Transformer Neural Network Training - CUDA GPU-Accelerated Version
+==============================================================================
+
+This is the production-grade, GPU-accelerated implementation of GPT-2 training
+using NVIDIA CUDA. Unlike the CPU reference implementation (train_gpt2.c), this
+version is heavily optimized for high-performance training on modern GPUs.
+
+KEY DIFFERENCES FROM CPU VERSION:
+- Uses CUDA kernels for parallelized computation on thousands of GPU cores
+- Leverages cuBLAS/cuBLASLt for optimized matrix multiplications
+- Supports mixed precision training (FP32, BF16, FP16) for faster computation
+- Implements multi-GPU training via NCCL for data parallelism
+- Uses GPU memory (VRAM) instead of system RAM for activations and parameters
+- Supports advanced optimizations: kernel fusion, gradient checkpointing, etc.
+
+CUDA PROGRAMMING CONCEPTS USED:
+- Device Memory: GPU VRAM allocated with cudaMalloc (vs. CPU RAM with malloc)
+- Host Memory: CPU RAM, with cudaMemcpy for data transfer between CPU/GPU
+- Kernels: GPU functions that run in parallel on thousands of threads
+- Streams: CUDA command queues for asynchronous GPU operations
+- cuBLAS: NVIDIA's optimized linear algebra library for GPUs
+
+ARCHITECTURE OVERVIEW:
+1. Model Parameters: Stored in GPU memory, updated via AdamW optimizer
+2. Forward Pass: Computes predictions through transformer layers on GPU
+3. Backward Pass: Computes gradients via backpropagation on GPU
+4. Optimizer: Updates weights using AdamW with optional master weights (FP32)
+5. Multi-GPU: Distributes work across GPUs using Data Parallel or ZeRO
+
+PERFORMANCE FEATURES:
+- Mixed precision: BF16 computation with FP32 master weights for stability
+- Gradient checkpointing: Recomputes activations during backward to save memory
+- GELU fusion: Fuses GELU activation into matrix multiply for efficiency
+- Kernel fusion: Combines operations to reduce memory bandwidth
+- Multi-GPU support: Data parallelism and ZeRO optimizer sharding
+
+See README.md for detailed usage instructions.
 */
-#include <unistd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <string>
-#include <string_view>
-#include <sys/stat.h>
-#include <sys/types.h>
+// Standard C/C++ library includes
+#include <unistd.h>      // POSIX operating system API
+#include <stdio.h>       // Standard I/O operations
+#include <stdlib.h>      // Memory allocation, process control
+#include <stdarg.h>      // Variable argument lists
+#include <string>        // C++ string class
+#include <string_view>   // Non-owning string references
+#include <sys/stat.h>    // File status and permissions
+#include <sys/types.h>   // System data types
+
 // ----------- CPU utilities -----------
+// Helper functions for file I/O, directory management, and error checking
 // defines: fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 // defines: create_dir_if_not_exists, find_max_step, ends_with_bin
 #include "llmc/utils.h"
+
+// Tokenizer for converting text to/from token IDs (GPT-2 BPE tokenizer)
 // defines: tokenizer_init, tokenizer_decode, tokenizer_free
 #include "llmc/tokenizer.h"
+
+// Data loading utilities for reading training/validation datasets
+// Handles sharded data files and multi-GPU data distribution
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 // defines: evalloader_init, evalloader_reset, evalloader_next_batch, evalloader_free
 #include "llmc/dataloader.h"
+
+// Random number generation utilities compatible with PyTorch
 // defines: manual_seed, normal_ (same as torch.manual_seed and torch.normal)
 #include "llmc/rand.h"
+
+// Learning rate schedulers (linear warmup, cosine decay, etc.)
 // defines: lr_scheduler_init, get_learning_rate
 #include "llmc/schedulers.h"
+
+// Sampling utilities for text generation from model logits
 // defines: sample_softmax, random_f32
 #include "llmc/sampler.h"
+
+// Logging utilities for tracking training metrics
 // defines: logger_init, logger_log_eval, logger_log_val, logger_log_train
 #include "llmc/logger.h"
+
+// Model FLOPs Utilization (MFU) calculation for performance monitoring
 // defines: get_flops_promised
 #include "llmc/mfu.h"
+
+// Outlier detection for identifying anomalous loss/gradient values
 // defines: OutlierDetector, init_detector, update_detector
 #include "llmc/outlier_detector.h"
+
 // ----------- GPU utilities -----------
-// defines:
-// WARP_SIZE, MAX_1024_THREADS_BLOCKS, CEIL_DIV, cudaCheck, PRECISION_MODE
-// NVTX_RANGE_FN
+// Core CUDA utilities and common definitions
+// WARP_SIZE: Number of threads in a CUDA warp (32 on NVIDIA GPUs)
+// MAX_1024_THREADS_BLOCKS: Maximum threads per block for kernel launches
+// CEIL_DIV: Ceiling division macro for calculating grid dimensions
+// cudaCheck: Macro for checking CUDA API return codes
+// PRECISION_MODE: Compilation flag for FP32/FP16/BF16 precision
+// NVTX_RANGE_FN: NVIDIA Tools Extension for profiling GPU code
 #include "llmc/cuda_common.h"
-// defines:
-// Packed128, f128, x128
-// warpReduceSum, warpReduceMax, blockReduce, copy_and_cast_kernel, cudaMallocConditionallyManaged
+
+// CUDA utility functions and data structures
+// Packed128: Vectorized memory access structure for coalesced reads/writes
+// f128, x128: 128-bit vector types for efficient memory bandwidth utilization
+// warpReduceSum, warpReduceMax: Efficient intra-warp reduction primitives
+// blockReduce: Block-level reduction using shared memory
+// copy_and_cast_kernel: Type conversion between FP32/FP16/BF16
+// cudaMallocConditionallyManaged: Smart allocation that falls back to managed memory if needed
 #include "llmc/cuda_utils.cuh"
-// defines: CUBLAS_LOWP, cublasCheck, cublaslt_workspace_size, cublaslt_workspace
-// defines: cublas_compute, cublaslt_handle, cublas_handle
+
+// cuBLAS and cuBLASLt configuration and utilities
+// cuBLAS: NVIDIA's GPU-accelerated Basic Linear Algebra Subprograms library
+// cuBLASLt: Lightweight cuBLAS with fused operations and mixed precision support
+// CUBLAS_LOWP: Low-precision compute mode (FP16/BF16)
+// cublasCheck: Error checking for cuBLAS API calls
+// cublaslt_workspace_size, cublaslt_workspace: Temporary GPU memory for cuBLASLt
+// cublas_compute: Compute type configuration (FP32, TF32, etc.)
+// cublaslt_handle, cublas_handle: cuBLAS library handles
 #include "llmc/cublas_common.h"
+
 // ----------- Layer implementations in CUDA -----------
+// Token and position embedding encoder (maps token IDs to dense vectors)
 // defines: encoder_forward, encoder_backward
 #include "llmc/encoder.cuh"
+
+// Layer normalization and residual connection kernels
+// Fused operations that combine multiple operations into a single kernel
+// for reduced memory bandwidth and improved performance
 // defines: layernorm_forward, residual_forward, fused_residual_forward5, layernorm_backward
 #include "llmc/layernorm.cuh"
-// defines: matmul_cublaslt, matmul_forward, matmul_backward, gelu_forward, gelu_backward_inplace
+
+// Matrix multiplication using cuBLASLt and GELU activation
+// matmul_cublaslt: Low-level interface to cuBLASLt for optimized GEMMs
+// matmul_forward/backward: Forward and backward passes for linear layers
+// gelu_forward: Gaussian Error Linear Unit activation function
+// gelu_backward_inplace: In-place GELU gradient computation
 #include "llmc/matmul.cuh"
+
 #ifdef ENABLE_CUDNN
+// cuDNN-accelerated attention implementation (optional, faster on some GPUs)
+// cuDNN: NVIDIA's Deep Neural Network library with highly optimized primitives
+// Uses flash attention and other optimizations for better performance
 // defines: create_cudnn, destroy_cudnn, attention_forward_cudnn, attention_backward_cudnn
 #include "llmc/cudnn_att.h"
 #else
+// Custom CUDA attention implementation (used when cuDNN is not available)
+// Implements multi-head self-attention with causal masking
 // defines: attention_forward, attention_backward
 #include "llmc/attention.cuh"
 #endif
+
+// Fused classifier kernel that combines final linear layer with softmax and loss
+// Computes cross-entropy loss and gradients in a single fused kernel
 // defines: fused_classifier
 #include "llmc/fused_classifier.cuh"
+
+// AdamW optimizer implementation on GPU
+// AdamW: Adam with decoupled weight decay (state-of-the-art optimizer for transformers)
+// Maintains first and second moment estimates on GPU for efficiency
 // defines: adamw_kernel3
 #include "llmc/adamw.cuh"
+
+// Global gradient norm calculation for gradient clipping
+// Computes L2 norm of all gradients across all parameters
 // defines: global_norm_squared
 #include "llmc/global_norm.cuh"
+
 // ----------- Multi-GPU support -----------
-// defines: ncclFloatX, ncclCheck, MultiGpuConfig, ShardInfo
-// defines: printf0, multi_gpu_config
-// defines: multi_gpu_config_init, multi_gpu_config_free
-// defines: set_zero_configs, multi_gpu_cpu_float_sum, multi_gpu_barrier
-// defines: multi_gpu_get_shard_offset, multi_gpu_async_reduce_gradient
+// NCCL (NVIDIA Collective Communications Library) for multi-GPU training
+// Implements data parallelism and ZeRO optimizer state sharding
+// ncclFloatX: NCCL datatype corresponding to the precision mode
+// ncclCheck: Error checking for NCCL operations
+// MultiGpuConfig: Configuration for multi-GPU setup (rank, world size, etc.)
+// ShardInfo: Information about parameter sharding across GPUs
+// printf0: Print only on rank 0 to avoid duplicate output
+// multi_gpu_config: Global multi-GPU configuration
+// multi_gpu_config_init/free: Initialize and cleanup multi-GPU setup
+// set_zero_configs: Configure ZeRO optimizer sharding
+// multi_gpu_cpu_float_sum: Sum a float value across all GPUs (on CPU)
+// multi_gpu_barrier: Synchronize all GPUs
+// multi_gpu_get_shard_offset: Get the shard offset for a parameter
+// multi_gpu_async_reduce_gradient: Asynchronous gradient averaging/reduction
 #include "llmc/zero.cuh"
 
+// ============================================================================
+// Global Variables
+// ============================================================================
+
 // ----------------------------------------------------------------------------
-// global vars for I/O
+// I/O Buffer
+// ----------------------------------------------------------------------------
+// Reusable buffer for constructing file paths throughout the program
+// Avoids repeated stack allocations for filename strings
 char filename_buffer[512];
 
 // ----------------------------------------------------------------------------
-// global vars containing information about the GPU this process is running on
-cudaDeviceProp deviceProp; // fills in common_start()
+// GPU Device Information and Configuration
+// ----------------------------------------------------------------------------
+// cudaDeviceProp: Structure containing GPU capabilities and properties
+//   - name: GPU model name (e.g., "NVIDIA A100-SXM4-40GB")
+//   - major/minor: Compute capability version (e.g., 8.0 for A100)
+//   - multiProcessorCount: Number of streaming multiprocessors (SMs)
+//   - clockRate: GPU core clock speed
+//   - totalGlobalMem: Total GPU memory in bytes
+// This is populated in common_start() to query the GPU's capabilities
+cudaDeviceProp deviceProp;
+
+// CUDA Stream: A sequence of GPU operations that execute in order
+// Using streams allows overlapping computation with data transfers for better performance
+// main_stream: The primary stream for all GPU operations in this program
+// All kernel launches and memory transfers use this stream for synchronization
 cudaStream_t main_stream;
-// buffer size to use for device <-> disk io
+
+// Buffer size for efficient device <-> disk I/O operations
+// 32 MB provides a good balance between memory usage and I/O performance
+// Used when reading/writing model checkpoints from disk to GPU memory
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 
-// ----------------------------------------------------------------------------
-// GPT-2 model definition
+// ============================================================================
+// GPT-2 Model Data Structures
+// ============================================================================
 
+// ----------------------------------------------------------------------------
+// Model Configuration
+// ----------------------------------------------------------------------------
+// GPT2Config: Hyperparameters defining the model architecture
+// These values are set based on which GPT-2 variant is being trained
 typedef struct {
-    int max_seq_len; // max sequence length, e.g. 1024
-    int vocab_size; // vocab size, e.g. 50257
-    int padded_vocab_size; // padded to e.g. %128==0, 50304
-    int num_layers; // number of layers, e.g. 12
-    int num_heads; // number of heads in attention, e.g. 12
-    int channels; // number of channels, e.g. 768
+    int max_seq_len;        // Maximum sequence length (T), e.g., 1024 for GPT-2, 2048 for GPT-3
+                            // Determines the size of the position embedding table
+
+    int vocab_size;         // Vocabulary size (V), e.g., 50257 for GPT-2
+                            // Number of unique tokens the model can process
+
+    int padded_vocab_size;  // Vocabulary size padded for GPU efficiency (Vp), e.g., 50304
+                            // Padded to be divisible by 128 for optimal memory coalescing
+                            // CUDA kernels perform best when tensor dimensions are multiples of warp size
+
+    int num_layers;         // Number of transformer layers (L), e.g., 12 for GPT-2 124M
+                            // Each layer contains attention + feedforward sublayers
+
+    int num_heads;          // Number of attention heads (NH), e.g., 12 for GPT-2 124M
+                            // Multi-head attention splits channels across heads for diverse representations
+
+    int channels;           // Model dimension / embedding size (C), e.g., 768 for GPT-2 124M
+                            // Also called d_model, this is the size of all hidden states
+                            // Must be divisible by num_heads
 } GPT2Config;
 
-// the parameters of the model
+// ----------------------------------------------------------------------------
+// Model Parameters (Weights and Biases)
+// ----------------------------------------------------------------------------
+// Total number of distinct parameter tensors in the GPT-2 model
 constexpr const int NUM_PARAMETER_TENSORS = 16;
+
+// ParameterTensors: All learnable weights and biases of the GPT-2 model
+// All pointers point into GPU device memory (allocated via cudaMalloc)
+// floatX is a typedef that can be float, __half, or __nv_bfloat16 depending on PRECISION_MODE
+//
+// MEMORY LAYOUT:
+// All parameter tensors are allocated in a single contiguous block on the GPU
+// This improves memory locality and simplifies memory management
+//
+// NOTATION: Shapes use (rows, cols) for matrices, matching typical ML notation
+//   V = vocab_size, Vp = padded_vocab_size, T = max_seq_len
+//   L = num_layers, C = channels, NH = num_heads
 typedef struct {
-    floatX* wte; // (V, C)
-    floatX* wpe; // (maxT, C)
-    floatX* ln1w; // (L, C)
-    floatX* ln1b; // (L, C)
-    floatX* qkvw; // (L, 3*C, C)
-    floatX* qkvb; // (L, 3*C)
-    floatX* attprojw; // (L, C, C)
-    floatX* attprojb; // (L, C)
-    floatX* ln2w; // (L, C)
-    floatX* ln2b; // (L, C)
-    floatX* fcw; // (L, 4*C, C)
-    floatX* fcb; // (L, 4*C)
-    floatX* fcprojw; // (L, C, 4*C)
-    floatX* fcprojb; // (L, C)
-    floatX* lnfw; // (C)
-    floatX* lnfb; // (C)
+    // Token Embeddings: Maps token IDs to dense vectors
+    floatX* wte;        // Shape: (Vp, C) - Token embedding table
+                        // wte[token_id] gives the C-dimensional embedding for that token
+                        // Weight shared with final output projection (tied embeddings)
+
+    // Position Embeddings: Adds positional information to token embeddings
+    floatX* wpe;        // Shape: (maxT, C) - Position embedding table
+                        // wpe[position] gives the position embedding for that sequence position
+                        // Learned absolute positional encodings (not sinusoidal like in original Transformer)
+
+    // First LayerNorm in each transformer block (pre-attention)
+    floatX* ln1w;       // Shape: (L, C) - LayerNorm weights (scale/gain)
+    floatX* ln1b;       // Shape: (L, C) - LayerNorm biases (shift/offset)
+
+    // Attention QKV projection: Projects input to Query, Key, Value
+    floatX* qkvw;       // Shape: (L, 3*C, C) - QKV weight matrix
+                        // Single matrix for all three projections (Q, K, V) for efficiency
+                        // Output is split into 3 parts during forward pass
+    floatX* qkvb;       // Shape: (L, 3*C) - QKV bias vector
+
+    // Attention output projection: Projects attention output back to residual stream
+    floatX* attprojw;   // Shape: (L, C, C) - Attention output projection weight
+    floatX* attprojb;   // Shape: (L, C) - Attention output projection bias
+
+    // Second LayerNorm in each transformer block (pre-feedforward)
+    floatX* ln2w;       // Shape: (L, C) - LayerNorm weights
+    floatX* ln2b;       // Shape: (L, C) - LayerNorm biases
+
+    // Feedforward network: Two-layer MLP with GELU activation
+    // First expands to 4*C (typical ratio in transformers)
+    floatX* fcw;        // Shape: (L, 4*C, C) - First feedforward layer weight
+    floatX* fcb;        // Shape: (L, 4*C) - First feedforward layer bias
+
+    // Second feedforward layer projects back to C dimensions
+    floatX* fcprojw;    // Shape: (L, C, 4*C) - Second feedforward layer weight
+    floatX* fcprojb;    // Shape: (L, C) - Second feedforward layer bias
+
+    // Final LayerNorm (applied after all transformer layers)
+    floatX* lnfw;       // Shape: (C,) - Final LayerNorm weights
+    floatX* lnfb;       // Shape: (C,) - Final LayerNorm biases
 } ParameterTensors;
+
+// Compile-time assertion to ensure struct layout matches expected size
+// This catches errors if fields are added/removed without updating NUM_PARAMETER_TENSORS
 static_assert(sizeof(ParameterTensors) == NUM_PARAMETER_TENSORS * sizeof(void*), "Inconsistent sizes!");
 
-void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
-    size_t Vp = config.padded_vocab_size;
-    size_t C = config.channels;
-    size_t maxT = config.max_seq_len;
-    size_t L = config.num_layers;
-    param_sizes[0] = Vp * C; // wte
-    param_sizes[1] = maxT * C; // wpe
-    param_sizes[2] = L * C; // ln1w
-    param_sizes[3] = L * C; // ln1b
-    param_sizes[4] = L * (3 * C) * C; // qkvw
-    param_sizes[5] = L * (3 * C); // qkvb
-    param_sizes[6] = L * C * C; // attprojw
-    param_sizes[7] = L * C; // attprojb
-    param_sizes[8] = L * C; // ln2w
-    param_sizes[9] = L * C; // ln2b
-    param_sizes[10] = L * (4 * C) * C; // fcw
-    param_sizes[11] = L * (4 * C); // fcb
-    param_sizes[12] = L * C * (4 * C); // fcprojw
-    param_sizes[13] = L * C; // fcprojb
-    param_sizes[14] = C; // lnfw
-    param_sizes[15] = C; // lnfb
+// ============================================================================
+// Parameter Memory Management Functions
+// ============================================================================
 
-    // populate the parameter sizes in bytes (all the same for now, keeping for future use)
+/*
+ * fill_in_parameter_sizes: Calculate the number of elements in each parameter tensor
+ *
+ * PARAMETERS:
+ *   param_sizes  - Output array of size NUM_PARAMETER_TENSORS to store element counts
+ *   param_sizeof - Output array of size NUM_PARAMETER_TENSORS to store per-element sizes in bytes
+ *   config       - Model configuration specifying architecture dimensions
+ *
+ * PURPOSE:
+ *   Computes how many elements (not bytes) are in each of the 16 parameter tensors.
+ *   This is used to allocate the right amount of GPU memory and to properly
+ *   partition the contiguous memory block into individual tensors.
+ *
+ * MEMORY CALCULATION EXAMPLE (GPT-2 124M):
+ *   - wte: 50304 * 768 = 38,633,472 elements (largest tensor)
+ *   - Total params ≈ 124M elements ≈ 248 MB (in BF16) or 496 MB (in FP32)
+ */
+void fill_in_parameter_sizes(size_t* param_sizes, size_t* param_sizeof, GPT2Config config) {
+    // Extract commonly used dimensions for readability
+    size_t Vp = config.padded_vocab_size;  // Padded vocabulary size
+    size_t C = config.channels;             // Model dimension
+    size_t maxT = config.max_seq_len;       // Maximum sequence length
+    size_t L = config.num_layers;           // Number of transformer layers
+
+    // Calculate element count for each parameter tensor
+    // Index order matches the ParameterTensors struct definition
+    param_sizes[0] = Vp * C;           // wte: Token embeddings
+    param_sizes[1] = maxT * C;         // wpe: Position embeddings
+    param_sizes[2] = L * C;            // ln1w: First LayerNorm weights
+    param_sizes[3] = L * C;            // ln1b: First LayerNorm biases
+    param_sizes[4] = L * (3 * C) * C;  // qkvw: QKV projection weights (3x because Q, K, V)
+    param_sizes[5] = L * (3 * C);      // qkvb: QKV projection biases
+    param_sizes[6] = L * C * C;        // attprojw: Attention output projection weights
+    param_sizes[7] = L * C;            // attprojb: Attention output projection biases
+    param_sizes[8] = L * C;            // ln2w: Second LayerNorm weights
+    param_sizes[9] = L * C;            // ln2b: Second LayerNorm biases
+    param_sizes[10] = L * (4 * C) * C; // fcw: First feedforward weights (4x expansion)
+    param_sizes[11] = L * (4 * C);     // fcb: First feedforward biases
+    param_sizes[12] = L * C * (4 * C); // fcprojw: Second feedforward weights
+    param_sizes[13] = L * C;           // fcprojb: Second feedforward biases
+    param_sizes[14] = C;               // lnfw: Final LayerNorm weights
+    param_sizes[15] = C;               // lnfb: Final LayerNorm biases
+
+    // Populate element sizes in bytes
+    // Currently all parameters use the same type (floatX), but this array allows
+    // for future flexibility (e.g., quantized weights with different element sizes)
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         param_sizeof[i] = sizeof(floatX);
     }
 }
 
-// allocate memory for the parameters and point the individual tensors to the right places
+/*
+ * malloc_and_point_parameters: Allocate GPU memory for all model parameters
+ *
+ * PARAMETERS:
+ *   params         - Pointer to ParameterTensors struct to populate with pointers
+ *   param_elements - Array of element counts for each tensor (from fill_in_parameter_sizes)
+ *   param_sizeof   - Array of per-element sizes in bytes for each tensor
+ *
+ * RETURNS:
+ *   Pointer to the base of the allocated GPU memory block
+ *
+ * GPU MEMORY ALLOCATION STRATEGY:
+ *   Instead of allocating each parameter tensor separately (16 cudaMalloc calls),
+ *   this function allocates ONE large contiguous block and partitions it.
+ *
+ *   BENEFITS:
+ *   1. Reduces cudaMalloc overhead (allocator calls are expensive)
+ *   2. Improves memory locality (parameters are adjacent in memory)
+ *   3. Simplifies memory management (single cudaFree instead of 16)
+ *   4. May reduce memory fragmentation
+ *
+ *   LAYOUT IN GPU MEMORY:
+ *   |wte|wpe|ln1w|ln1b|qkvw|qkvb|attprojw|attprojb|ln2w|ln2b|fcw|fcb|fcprojw|fcprojb|lnfw|lnfb|
+ *
+ * EXAMPLE (GPT-2 124M in BF16):
+ *   Total allocation: ~248 MB on GPU
+ */
 void* malloc_and_point_parameters(ParameterTensors* params, size_t* param_elements, size_t *param_sizeof) {
-    // calculate the total number of parameters and bytes across all tensors
+    // Calculate the total number of bytes needed for all parameters
     size_t num_parameters_bytes = 0;
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters_bytes += param_elements[i] * param_sizeof[i];
     }
-    // malloc all parameters all at once on the device
+
+    // Allocate all parameters in one contiguous block on the GPU device
+    // cudaMalloc allocates in GPU global memory (VRAM), not CPU RAM
     void* params_memory;
     cudaCheck(cudaMalloc((void**)&params_memory, num_parameters_bytes));
-    // assign all the tensors their place in the array
+
+    // Set up array of pointers to the parameter fields in the ParameterTensors struct
+    // This allows us to iterate through them programmatically
     floatX** ptrs[] = {
         &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw, &params->qkvb,
         &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b, &params->fcw, &params->fcb,
         &params->fcprojw, &params->fcprojb, &params->lnfw, &params->lnfb
     };
-    char* params_memory_iterator = (char*)params_memory;
+
+    // Partition the contiguous memory block into individual tensors
+    // Each tensor pointer in the struct points to its slice of the memory block
+    char* params_memory_iterator = (char*)params_memory;  // Use char* for byte-level arithmetic
     for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-        *(ptrs[i]) = (floatX*)params_memory_iterator;
-        params_memory_iterator += param_elements[i] * param_sizeof[i];
+        *(ptrs[i]) = (floatX*)params_memory_iterator;  // Assign this tensor's starting address
+        params_memory_iterator += param_elements[i] * param_sizeof[i];  // Advance to next tensor
     }
+
+    // Return the base pointer so caller can free it later with a single cudaFree()
     return params_memory;
 }
 
+// ----------------------------------------------------------------------------
+// Activation Tensors (Intermediate Values During Forward/Backward Pass)
+// ----------------------------------------------------------------------------
 constexpr int NUM_ACTIVATION_TENSORS = 21;
+
+/*
+ * ActivationTensors: Stores all intermediate activations during forward pass
+ *
+ * MEMORY ALLOCATION:
+ *   Like parameters, all activations are allocated in one contiguous GPU memory block
+ *   These tensors are only needed during training, not for inference-only deployment
+ *
+ * GRADIENT CHECKPOINTING / RECOMPUTATION:
+ *   Some tensors can be freed and recomputed during backward pass to save memory
+ *   The 'recompute' flag controls which activations are saved vs recomputed:
+ *   - recompute=0: Save all activations (uses most memory, fastest)
+ *   - recompute=1: Recompute GELU activations during backward
+ *   - recompute=2: Recompute GELU + LayerNorm activations during backward (saves most memory)
+ *
+ * NOTATION:
+ *   B = batch_size, T = seq_len, C = channels, L = num_layers, NH = num_heads, V = vocab_size
+ */
 typedef struct {
-    floatX* encoded; // (B, T, C)
-    floatX* ln1; // (L, B, T, C)
-    float* ln1_mean; // (L, B, T)
-    float* ln1_rstd; // (L, B, T)
-    floatX* atty; // (L, B, T, C)
-    // cuDNN saves only some statistics information
+    // Initial embeddings (token + position embeddings summed)
+    floatX* encoded;        // Shape: (B, T, C)
+                            // Output of encoder_forward, input to first transformer layer
+
+    // First LayerNorm activations (pre-attention)
+    floatX* ln1;            // Shape: (L, B, T, C)
+                            // Normalized input to attention, saved for backward pass
+                            // If recompute >= 2, this is NULL and recomputed during backward
+    float* ln1_mean;        // Shape: (L, B, T)
+                            // Mean values for each LayerNorm, needed for backward
+    float* ln1_rstd;        // Shape: (L, B, T)
+                            // Reciprocal standard deviation (1/sqrt(var + eps)) for backward
+
+    // Attention output
+    floatX* atty;           // Shape: (L, B, T, C)
+                            // Output of attention mechanism, before residual connection
+
+    // Attention weights (different sizes for cuDNN vs custom attention)
 #if ENABLE_CUDNN
-    float* att;  // (L, B, NH, T)
+    float* att;             // Shape: (L, B, NH, T) - cuDNN format
+                            // cuDNN uses a compact representation, stores only statistics
 #else
-    floatX* att; // (L, B, NH, T, T)
+    floatX* att;            // Shape: (L, B, NH, T, T) - Full attention matrix
+                            // att[l, b, h, i, j] = attention weight from position i to position j
+                            // Causal masking ensures att[..., i, j] = 0 for j > i
 #endif
 
-    floatX* residual2; // (L, B, T, C)
-    floatX* ln2; // (L, B, T, C)
-    float* ln2_mean; // (L, B, T)
-    float* ln2_rstd; // (L, B, T)
-    floatX* fch; // (L, B, T, 4*C)
-    floatX* fch_gelu; // (L, B, T, 4*C)
-    floatX* residual3; // (L, B, T, C)
-    floatX* lnf; // (B, T, C);   if LN recomputation is enabled (-r 2 and above), will be used for _all_ layernorms
-    float* lnf_mean; // (B, T)
-    float* lnf_rstd; // (B, T)
-    float* losses; // (B, T), will be accumulated in micro-steps
-    // adding these two compared to the CPU .c code, needed for attention kernel as buffers
-    floatX* qkvr; // (L, B, T, 3*C)
-    // in inference mode, this buffer will store the logits
-    // in training mode, this buffer will contain the *gradients* of the logits.
-    // during the processing of transformer blocks, we will also use this as a
-    // general scratchpad buffer. Allocation is made large enough to hold (B, T, 3C),
-    // (B, NH, T, T), and (B, T, V) shaped tensors.
-    floatX* output;
+    // First residual connection output (after attention)
+    floatX* residual2;      // Shape: (L, B, T, C)
+                            // residual2 = residual + atty (skip connection)
 
-    // some additional scratch buffers
-    floatX* scratch_bt4c;   // (B, T, 4*C)
-    floatX* scratch_btc;    // (B, T, C)
+    // Second LayerNorm activations (pre-feedforward)
+    floatX* ln2;            // Shape: (L, B, T, C)
+                            // Normalized input to feedforward network
+                            // If recompute >= 2, this is NULL and recomputed
+    float* ln2_mean;        // Shape: (L, B, T)
+    float* ln2_rstd;        // Shape: (L, B, T)
+
+    // Feedforward network activations
+    floatX* fch;            // Shape: (L, B, T, 4*C)
+                            // First feedforward layer output (before GELU activation)
+    floatX* fch_gelu;       // Shape: (L, B, T, 4*C) if recompute < 1, else (B, T, 4*C)
+                            // After GELU activation: fch_gelu = GELU(fch)
+                            // If recompute >= 1, only one layer's worth is allocated and reused
+
+    // Second residual connection output (after feedforward)
+    floatX* residual3;      // Shape: (L, B, T, C)
+                            // residual3 = residual2 + fcproj_output (skip connection)
+                            // This is the final output of each transformer layer
+
+    // Final LayerNorm (after all transformer layers)
+    floatX* lnf;            // Shape: (B, T, C)
+                            // Final normalized hidden states before output projection
+                            // If recompute >= 2, this buffer is reused for ALL layernorms
+    float* lnf_mean;        // Shape: (B, T)
+    float* lnf_rstd;        // Shape: (B, T)
+
+    // Loss computation
+    float* losses;          // Shape: (B, T)
+                            // Per-token cross-entropy losses, accumulated across micro-steps
+                            // losses[b, t] = -log P(target[b, t] | input[b, :t])
+
+    // QKV buffer (GPU-specific optimization)
+    floatX* qkvr;           // Shape: (L, B, T, 3*C)
+                            // Stores Query, Key, Value projections before splitting
+                            // Not present in CPU version, needed for efficient GPU kernels
+
+    // Multi-purpose output/scratch buffer
+    floatX* output;         // Shape: max(B*T*3*C, B*NH*T*T, B*T*Vp)
+                            // FORWARD PASS (inference): Stores final logits (B, T, Vp)
+                            // BACKWARD PASS (training): Stores gradient of logits (dlogits)
+                            // INTERMEDIATE: Used as scratch space during transformer blocks
+                            // Size is the maximum of all uses to allow reuse
+
+    // Additional scratch buffers for intermediate computations
+    floatX* scratch_bt4c;   // Shape: (B, T, 4*C)
+                            // Temporary storage for feedforward backward pass
+    floatX* scratch_btc;    // Shape: (B, T, C)
+                            // Temporary storage for gradient accumulation
 } ActivationTensors;
 
 
@@ -282,43 +604,90 @@ void* malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]
     return acts_memory;
 }
 
+// ----------------------------------------------------------------------------
+// Main GPT-2 Model Structure
+// ----------------------------------------------------------------------------
+/*
+ * GPT2: Complete state of the GPT-2 model including parameters, activations, and optimizer state
+ *
+ * MEMORY ARCHITECTURE:
+ *   The model uses a carefully designed memory layout to maximize GPU efficiency:
+ *   1. Parameters (params_memory): Model weights on GPU (BF16/FP16/FP32)
+ *   2. Gradients (grads_memory): Parameter gradients on GPU (same type as params)
+ *   3. Optimizer state (m_memory, v_memory): AdamW moments on GPU (FP32)
+ *   4. Master weights (master_weights): Optional FP32 copy of params for stability
+ *   5. Activations (acts_memory): Intermediate values during forward/backward
+ *
+ * MIXED PRECISION TRAINING:
+ *   For BF16/FP16 training with master weights:
+ *   - Forward/backward passes use BF16/FP16 for speed
+ *   - Optimizer maintains FP32 master weights for numerical stability
+ *   - After each update, master weights are rounded down to BF16/FP16
+ *
+ * MULTI-GPU SUPPORT:
+ *   - ZeRO Stage 0: All GPUs have full copy of params, grads averaged
+ *   - ZeRO Stage 1: Optimizer states sharded across GPUs
+ *   See multi_gpu_config in zero.cuh for details
+ */
 typedef struct {
+    // Model architecture configuration
     GPT2Config config;
-    // the weights of the model, and their sizes
-    ParameterTensors params;
-    size_t param_elements[NUM_PARAMETER_TENSORS];
-    size_t param_sizeof[NUM_PARAMETER_TENSORS];
-    void* params_memory;
-    size_t num_parameters;
-    size_t num_parameters_bytes;
-    // gradients of the weights
-    ParameterTensors grads;
-    void* grads_memory;
-    // buffers for the AdamW optimizer
-    float* m_memory;
-    float* v_memory;
-    float* master_weights;     // is NULL unless fp32 weights is enabled.
-    // the activations of the model, and their sizes
-    ActivationTensors acts;
-    TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];
-    void* acts_memory;
-    // other run state configuration
-    int batch_size; // the batch size (B) of current forward pass
-    int seq_len; // the sequence length (T) of current forward pass
-    int* inputs; // the input tokens for the current forward pass
-    int* targets; // the target tokens for the current forward pass
-    float mean_loss; // after the last backward micro-batch, will be populated with mean loss across all GPUs and micro-steps
-    float* accumulated_mean_loss; // GPU buffer used to accumulate loss across micro-steps
-    float* cpu_losses; // CPU buffer to copy the losses to, allocated with cudaMallocHost
-    unsigned long long rng_state; // the RNG state for seeding stochastic rounding etc.
-    unsigned long long rng_state_last_update; // RNG before last gpt2_update() to re-round identically from master weights
-    int use_master_weights; // keep master weights copy in float for optim update? 0|1
-    bool init_state;   // set to true if master weights need to be initialized
-    int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
-    int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
-    // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
-    int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
-    int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
+
+    // ========== Parameters (Model Weights) ==========
+    ParameterTensors params;                        // Pointers to individual parameter tensors on GPU
+    size_t param_elements[NUM_PARAMETER_TENSORS];   // Number of elements in each tensor
+    size_t param_sizeof[NUM_PARAMETER_TENSORS];     // Size of each element in bytes (sizeof(floatX))
+    void* params_memory;                            // Base pointer to allocated GPU memory for all params
+    size_t num_parameters;                          // Total number of parameters (e.g., 124M)
+    size_t num_parameters_bytes;                    // Total bytes for all parameters
+
+    // ========== Gradients ==========
+    ParameterTensors grads;                         // Gradients of parameters (same structure as params)
+    void* grads_memory;                             // Base pointer to GPU memory for all gradients
+
+    // ========== AdamW Optimizer State ==========
+    // AdamW maintains exponential moving averages of gradients and squared gradients
+    float* m_memory;                                // First moment estimates (momentum) - always FP32
+    float* v_memory;                                // Second moment estimates (RMSprop) - always FP32
+    float* master_weights;                          // FP32 master copy of params (NULL if disabled)
+                                                    // Enables stable mixed-precision training
+
+    // ========== Activations (Forward Pass Intermediate Values) ==========
+    ActivationTensors acts;                         // Pointers to activation tensors
+    TensorSpec acts_specs[NUM_ACTIVATION_TENSORS];  // Size and type specifications for each activation
+    void* acts_memory;                              // Base pointer to GPU memory for all activations
+
+    // ========== Runtime State ==========
+    int batch_size;                                 // Current batch size (B), set on first forward()
+    int seq_len;                                    // Current sequence length (T), set on first forward()
+    int* inputs;                                    // Input token IDs on GPU, shape: (B, T)
+    int* targets;                                   // Target token IDs on GPU, shape: (B, T)
+
+    // ========== Loss Tracking ==========
+    float mean_loss;                                // Mean loss from last backward pass (averaged across GPUs)
+                                                    // -1.0f indicates no loss computed yet
+    float* accumulated_mean_loss;                   // GPU buffer to accumulate loss across micro-steps
+    float* cpu_losses;                              // CPU buffer for per-token losses, shape: (B, T)
+                                                    // Allocated with cudaMallocHost (pinned memory) for fast transfers
+
+    // ========== Random Number Generation ==========
+    unsigned long long rng_state;                   // Current RNG state for stochastic rounding
+    unsigned long long rng_state_last_update;       // RNG state before last optimizer update
+                                                    // Allows replaying rounding from master weights
+
+    // ========== Training Configuration Flags ==========
+    int use_master_weights;                         // 1 = keep FP32 master weights, 0 = disabled
+    bool init_state;                                // True if optimizer state needs initialization
+    int gelu_fusion;                                // GELU fusion mode:
+                                                    // 0 = no fusion, 1 = fuse in forward, 2 = fuse in forward+backward
+    int recompute;                                  // Activation recomputation mode (gradient checkpointing):
+                                                    // 0 = save all, 1 = recompute GELU, 2 = recompute GELU+LayerNorm
+
+    // ========== CPU Scratch Buffers (for encoder_backward workload distribution) ==========
+    int* workload_indices;                          // CPU buffer for encoder backward pass
+                                                    // Size: B*T*num_c_groups (int)
+    int4* bucket_info;                              // CPU buffer for encoder backward pass
+                                                    // Size: B*T*num_c_groups (int4)
 } GPT2;
 
 void gpt2_init_common(GPT2 *model) {
@@ -641,116 +1010,248 @@ void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
     free(params_memory_cpu);
 }
 
-// propagate inputs through the network to produce logits.
-// right now, this function is fully synchronous with the host
-void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
-    NVTX_RANGE_FN();
-    // we must be careful and use size_t instead of int, otherwise
-    // we could overflow int. E.g. l * B * NH * T * T overflows int at B 16.
+// ============================================================================
+// Forward Pass: Compute Model Predictions
+// ============================================================================
 
-    // ensure the model was initialized or error out
+/*
+ * gpt2_forward: Execute forward pass through the GPT-2 model on GPU
+ *
+ * PARAMETERS:
+ *   model  - Pointer to GPT2 model structure (must be initialized)
+ *   inputs - Host (CPU) memory pointer to input token IDs, shape: (B, T)
+ *   B      - Batch size (number of sequences to process in parallel)
+ *   T      - Sequence length (number of tokens in each sequence)
+ *
+ * OUTPUTS:
+ *   After execution, model->acts.output contains logits, shape: (B, T, Vp)
+ *   logits[b, t, v] = unnormalized log probability of token v at position t in sequence b
+ *
+ * ALGORITHM:
+ *   1. Encoder: Convert token IDs to embeddings (token + position embeddings)
+ *   2. For each transformer layer:
+ *      a. LayerNorm + Multi-head self-attention + Residual connection
+ *      b. LayerNorm + Feedforward network + Residual connection
+ *   3. Final LayerNorm
+ *   4. Project to vocabulary size (logits)
+ *
+ * GPU SYNCHRONIZATION:
+ *   - All operations are launched on main_stream
+ *   - Function ends with cudaDeviceSynchronize() to ensure completion
+ *   - This makes the function blocking (host waits for GPU)
+ *
+ * PERFORMANCE NOTES:
+ *   - Uses cuBLASLt for matrix multiplications (highly optimized)
+ *   - Attention can use cuDNN (if ENABLE_CUDNN) or custom CUDA kernels
+ *   - Fusion optimizations: fused residual+layernorm, optional GELU fusion
+ *   - Memory reuse: scratch buffers are reused to minimize allocations
+ *
+ * MEMORY TRANSFERS:
+ *   - Input token IDs are copied from host to device (cudaMemcpy)
+ *   - All computation happens on GPU
+ *   - Logits remain on GPU (copied to host only if needed for inference)
+ */
+void gpt2_forward(GPT2 *model, const int* inputs, size_t B, size_t T) {
+    // NVTX markers for profiling with NVIDIA Nsight Systems
+    NVTX_RANGE_FN();
+
+    // Use size_t instead of int to avoid overflow in large models
+    // Example: l * B * NH * T * T can overflow 32-bit int at B=16 for large models
+    // size_t is 64-bit, providing much larger range
+
+    // Validate model initialization
     if (model->params_memory == NULL) {
         printf("Error: model was not initialized properly.\n");
         exit(EXIT_FAILURE);
     }
 
-    // convenience parameters
-    const size_t V = model->config.vocab_size;
-    const size_t Vp = model->config.padded_vocab_size;
-    const size_t L = model->config.num_layers;
-    const size_t NH = model->config.num_heads;
-    const size_t C = model->config.channels;
+    // Extract model configuration for convenience
+    const size_t V = model->config.vocab_size;          // Actual vocabulary size (50257 for GPT-2)
+    const size_t Vp = model->config.padded_vocab_size;  // Padded vocab size (50304 for GPT-2)
+    const size_t L = model->config.num_layers;          // Number of transformer layers
+    const size_t NH = model->config.num_heads;          // Number of attention heads
+    const size_t C = model->config.channels;            // Model dimension
 
-    // validate B,T are not larger than the values used at initialisation
-    // (smaller B,T are okay for inference only)
+    // Validate batch size and sequence length
+    // The model's activation buffers are allocated for specific (B, T) dimensions
+    // Smaller (B, T) is OK for inference, but larger would overflow buffers
     if (B > model->batch_size || T > model->seq_len) {
         printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
         exit(EXIT_FAILURE);
     }
 
-    // copy inputs/targets to the model
+    // ========== Transfer Input Data to GPU ==========
+    // Copy input token IDs from CPU (host) to GPU (device)
+    // This is one of the few host-device data transfers in the forward pass
     cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    // validate inputs, all indices must be in the range [0, V)
-    // we can do this while the copies are already underway
+
+    // Validate input tokens on CPU while GPU copy is in progress
+    // All token IDs must be in range [0, V), otherwise indexing errors will occur
     tokenCheck(inputs, B*T, V);
 
-    // forward pass
-    ParameterTensors params = model->params; // for brevity
+    // ========== Forward Pass Computation ==========
+    // Extract pointers for convenience and readability
+    ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
-    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream); // encoding goes into residual[0]
 
-    // first layernorm isn't fused
+    // STEP 1: Encoder - Convert token IDs to embeddings
+    // encoder_forward adds token embeddings (wte) and position embeddings (wpe)
+    // Output shape: (B, T, C) stored in acts.encoded
+    // Formula: encoded[b, t, :] = wte[inputs[b, t], :] + wpe[t, :]
+    encoder_forward(acts.encoded, model->inputs, params.wte, params.wpe, B, T, C, main_stream);
+
+    // STEP 2: First LayerNorm (applied before first transformer layer)
+    // This LayerNorm is NOT fused with a residual connection (unlike later ones)
+    // If recompute >= 2, we reuse the lnf buffer to save memory
     layernorm_forward((model->recompute < 2) ? acts.ln1 : acts.lnf, acts.ln1_mean, acts.ln1_rstd, acts.encoded, params.ln1w, params.ln1b, B, T, C, main_stream);
 
+    // ========== STEP 3: Transformer Layers ==========
+    // Each layer applies: Attention block + Feedforward block
+    // Both blocks use Pre-LayerNorm architecture (normalize before operation)
+    // and include residual connections (skip connections)
     for (int l = 0; l < L; l++) {
+        // NVTX profiling marker for this layer
         NvtxRange layer_range("Layer", l);
 
+        // ========== Get Input Residual Stream for This Layer ==========
+        // The residual stream carries information through the network
+        // Layer 0 uses the initial encoded embeddings
+        // Subsequent layers use the output (residual3) from the previous layer
         floatX* residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        // get the pointers of the weights for this layer
-        floatX* l_qkvw = params.qkvw + l * 3*C * C;
-        floatX* l_qkvb = params.qkvb + l * 3*C;
-        floatX* l_attprojw = params.attprojw + l * C * C;
-        floatX* l_attprojb = params.attprojb + l * C;
-        floatX* l_ln2w = params.ln2w + l * C;
-        floatX* l_ln2b = params.ln2b + l * C;
-        floatX* l_fcw = params.fcw + l * 4*C * C;
-        floatX* l_fcb = params.fcb + l * 4*C;
-        floatX* l_fcprojw = params.fcprojw + l * C * 4*C;
-        floatX* l_fcprojb = params.fcprojb + l * C;
+        // ========== Get Pointers to This Layer's Parameters ==========
+        // All parameter tensors are stored contiguously per layer
+        // We offset into the params tensors to get this layer's slice
+        floatX* l_qkvw = params.qkvw + l * 3*C * C;       // QKV projection weights
+        floatX* l_qkvb = params.qkvb + l * 3*C;           // QKV projection biases
+        floatX* l_attprojw = params.attprojw + l * C * C; // Attention output projection weights
+        floatX* l_attprojb = params.attprojb + l * C;     // Attention output projection biases
+        floatX* l_ln2w = params.ln2w + l * C;             // Second LayerNorm weights
+        floatX* l_ln2b = params.ln2b + l * C;             // Second LayerNorm biases
+        floatX* l_fcw = params.fcw + l * 4*C * C;         // Feedforward first layer weights
+        floatX* l_fcb = params.fcb + l * 4*C;             // Feedforward first layer biases
+        floatX* l_fcprojw = params.fcprojw + l * C * 4*C; // Feedforward second layer weights
+        floatX* l_fcprojb = params.fcprojb + l * C;       // Feedforward second layer biases
 
-        // get the pointers of the activations for this layer
+        // ========== Get Pointers to This Layer's Activation Buffers ==========
+        // If recompute >= 2, LayerNorm activations are not saved, we reuse lnf buffer
         floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + l * B * T * C : acts.lnf;
-        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;
-        floatX* l_atty = acts.atty + l * B * T * C;
-        floatX* l_residual2 = acts.residual2 + l * B * T * C;
+        floatX* l_qkvr = acts.qkvr + l * B * T * 3*C;     // QKV output buffer
+        floatX* l_atty = acts.atty + l * B * T * C;       // Attention output
+        floatX* l_residual2 = acts.residual2 + l * B * T * C; // After attention residual connection
         floatX* l_ln2 = (model->recompute < 2) ? acts.ln2 + l * B * T * C : acts.lnf;
-        float* l_ln2_mean = acts.ln2_mean + l * B * T;
-        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;
-        floatX* l_fch = acts.fch + l * B * T * 4*C;
-        // reuse the same activation buffer at each layer, as we'll re-compute the gelu during backward
-        // very useful because we dramatically reduce VRAM usage, and may be able to fit larger batch size
-        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
-        floatX* l_residual3 = acts.residual3 + l * B * T * C;
-        floatX* scratch = (floatX*)acts.output; // used for non-cudnn attention, fcproj, attproj, etc.
+        float* l_ln2_mean = acts.ln2_mean + l * B * T;    // Second LayerNorm mean
+        float* l_ln2_rstd = acts.ln2_rstd + l * B * T;    // Second LayerNorm rstd
+        floatX* l_fch = acts.fch + l * B * T * 4*C;       // Feedforward hidden layer (before GELU)
 
-        // now do the forward pass
+        // GRADIENT CHECKPOINTING OPTIMIZATION:
+        // If recompute >= 1, we don't save GELU activations for all layers
+        // Instead, we reuse a single buffer and recompute GELU during backward
+        // This saves significant memory: L * B * T * 4*C elements
+        floatX* l_fch_gelu = (model->recompute < 1) ? acts.fch_gelu + l * B * T * 4*C : acts.fch_gelu;
+
+        floatX* l_residual3 = acts.residual3 + l * B * T * C; // Final layer output
+
+        // Scratch buffer for intermediate computations
+        // Reused for QKV matmul output, attention projection, feedforward projection
+        floatX* scratch = (floatX*)acts.output;
+
+        // ========== ATTENTION BLOCK ==========
+        // Implements multi-head self-attention with causal masking
+        // Input: l_ln1 (normalized residual stream)
+        // Output: l_atty (attention output, before residual connection)
+
         #ifdef ENABLE_CUDNN
-        float* l_att = (float*)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
+        // ===== cuDNN Attention Path (Optimized) =====
+        // Uses NVIDIA's cuDNN library for highly optimized attention
+        float* l_att = (float*)acts.att + l * B * NH * T;
+
+        // 1. Compute Q, K, V projections using cuBLASLt (matrix multiply)
+        //    l_qkvr = l_ln1 @ l_qkvw + l_qkvb
+        //    Output shape: (B, T, 3*C) where 3*C = C for Q + C for K + C for V
         matmul_forward_cublaslt(l_qkvr, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+
+        // 2. Apply multi-head attention using cuDNN
+        //    Internally splits l_qkvr into Q, K, V and computes attention
         attention_forward_cudnn(l_atty, (float*)l_att, l_qkvr, B, T, NH, C, main_stream);
+
         #else
+        // ===== Custom CUDA Attention Path =====
+        // Used when cuDNN is not available or disabled
         floatX* l_att = acts.att + l * B * NH * T * T;
-        if (T != model->seq_len) { // unused parts of attention buffer must be zeroed (T-dependent)
+
+        // Clear attention buffer if sequence length changed
+        // Causal masking requires future positions to be zero
+        if (T != model->seq_len) {
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
         }
-        // these are only needed as scratchpads for the forward pass, but
-        // need not be stored for backward
+
+        // 1. Compute QKV projections (same as cuDNN path)
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C, main_stream);
+
+        // 2. Apply custom attention kernel
+        //    Computes: softmax(Q @ K^T / sqrt(d_k)) @ V with causal masking
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
         #endif
 
+        // 3. Project attention output back to residual stream dimension
+        //    scratch = l_atty @ l_attprojw + l_attprojb
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+
+        // 4. FUSED: Add residual connection + Apply LayerNorm for next block
+        //    l_residual2 = residual + scratch (residual connection)
+        //    l_ln2 = LayerNorm(l_residual2) (prepare for feedforward)
+        //    This fusion reduces memory bandwidth by combining operations
         fused_residual_forward5(l_residual2, l_ln2, l_ln2_mean, l_ln2_rstd, residual, scratch, l_ln2w, l_ln2b, B*T, C, main_stream);
+
+        // ========== FEEDFORWARD BLOCK ==========
+        // Two-layer MLP with GELU activation: FFN(x) = W2 @ GELU(W1 @ x + b1) + b2
+        // Expands to 4*C then projects back to C (typical transformer ratio)
+
+        // 1. First feedforward layer with optional GELU fusion
+        //    l_fch = l_ln2 @ l_fcw + l_fcb (linear transformation)
+        //    l_fch_gelu = GELU(l_fch) (activation, may be fused into matmul)
+        //    gelu_fusion flag controls whether GELU is fused into the matrix multiply
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4*C, main_stream, l_fch, model->gelu_fusion);
+
+        // 2. Second feedforward layer (projection back to C dimensions)
+        //    scratch = l_fch_gelu @ l_fcprojw + l_fcprojb
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C, main_stream);
-        // OK, fusion across blocks.
+
+        // ========== CROSS-LAYER FUSION OPTIMIZATION ==========
+        // Fuse this layer's residual with next layer's LayerNorm to reduce memory traffic
         if(l+1 != L) {
+            // Not the last layer: prepare first LayerNorm for next layer
             floatX* l_ln1 = (model->recompute < 2) ? acts.ln1 + (l + 1) * B * T * C : acts.lnf;
             float* l_ln1_mean = acts.ln1_mean + (l + 1) * B * T;
             float* l_ln1_rstd = acts.ln1_rstd + (l + 1) * B * T;
             const floatX* l_ln1w = params.ln1w + (l + 1) * C;
             const floatX* l_ln1b = params.ln1b + (l + 1) * C;
+
+            // l_residual3 = l_residual2 + scratch (residual connection)
+            // l_ln1 = LayerNorm(l_residual3) (prepare for next layer's attention)
             fused_residual_forward5(l_residual3, l_ln1, l_ln1_mean, l_ln1_rstd, l_residual2, scratch, l_ln1w, l_ln1b,
                                     B * T, C, main_stream);
         } else {
+            // Last layer: apply final LayerNorm instead of next layer's LayerNorm
+            // l_residual3 = l_residual2 + scratch (residual connection)
+            // acts.lnf = LayerNorm(l_residual3) (prepare for output projection)
             fused_residual_forward5(l_residual3, acts.lnf, acts.lnf_mean, acts.lnf_rstd, l_residual2, scratch,
                                     params.lnfw, params.lnfb,
                                     B * T, C, main_stream);
         }
     }
 
+    // ========== STEP 4: Output Projection to Vocabulary ==========
+    // Project final hidden states to vocabulary logits
+    // acts.output = acts.lnf @ params.wte^T (weight tying: same as token embeddings)
+    // Output shape: (B, T, Vp) - logits for each token position
+    // Note: No bias in the final projection (standard in GPT-2)
     matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
+
+    // ========== Synchronize GPU ==========
+    // Wait for all GPU operations to complete before returning
+    // This ensures activations are ready for subsequent loss computation or backward pass
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -785,23 +1286,78 @@ float gpt2_validate(GPT2 *model, const int* inputs, const int* targets, size_t B
     return mean_loss;
 }
 
+// ============================================================================
+// Backward Pass: Compute Gradients via Backpropagation
+// ============================================================================
+
+/*
+ * gpt2_backward_and_reduce: Execute backward pass and gradient reduction across GPUs
+ *
+ * PARAMETERS:
+ *   model            - GPT2 model with populated activations from forward pass
+ *   inputs           - Input token IDs (only used for encoder backward)
+ *   targets          - Target token IDs for loss computation, shape: (B, T)
+ *   grad_accum_steps - Number of gradient accumulation steps
+ *   micro_step       - Current micro-step index (0 to grad_accum_steps-1)
+ *
+ * GRADIENT ACCUMULATION:
+ *   Instead of updating weights after every batch, we can accumulate gradients
+ *   across multiple micro-batches to simulate a larger effective batch size.
+ *   This is crucial when GPU memory limits the batch size.
+ *
+ *   EXAMPLE:
+ *     grad_accum_steps = 4, micro_batch_size = 8
+ *     Effective batch size = 4 * 8 = 32
+ *
+ *   STEPS:
+ *     1. micro_step 0: Zero gradients, forward, backward (gradients += ...)
+ *     2. micro_step 1-2: Forward, backward (gradients += ...)
+ *     3. micro_step 3: Forward, backward (gradients += ...), reduce gradients, update weights
+ *
+ * MULTI-GPU GRADIENT REDUCTION:
+ *   On the last micro-step, gradients are synchronized across all GPUs:
+ *   - ZeRO Stage 0: Average gradients via AllReduce
+ *   - ZeRO Stage 1: ReduceScatter to shard gradients across GPUs
+ *
+ * ALGORITHM:
+ *   1. Compute loss and dL/d(logits) via fused classifier
+ *   2. Backpropagate through final LayerNorm
+ *   3. For each transformer layer (in reverse):
+ *      - Backpropagate through feedforward block
+ *      - Backpropagate through attention block
+ *   4. Backpropagate through encoder (embedding layers)
+ *   5. On last step: Reduce gradients across GPUs
+ *
+ * MEMORY REUSE:
+ *   - Uses acts.output as scratch buffer for intermediate gradients
+ *   - Recomputes activations if gradient checkpointing is enabled
+ *   - Gradient buffers are reused across layers
+ */
 void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int grad_accum_steps, int micro_step) {
+    // Validate gradient memory is allocated
     if(model->grads_memory == nullptr) {
         fprintf(stderr, "Need to allocate gradients before backward");
         exit(EXIT_FAILURE);
     }
+
+    // NVTX profiling marker
     NVTX_RANGE_FN();
+
+    // Check if this is the last micro-step (when we'll do gradient reduction and weight update)
     bool last_step = micro_step == grad_accum_steps - 1;
-    // on the first micro-step zero the gradients, as we're about to += accumulate into them
+
+    // ========== Initialize Gradient Accumulation ==========
+    // On the first micro-step, zero out gradient buffers
+    // On subsequent micro-steps, we accumulate (+=) into existing gradients
     if (micro_step == 0) {
-        // there are currently two state vars during the gradient accumulation inner loop:
-        // 1) the losses accumulate += into acts.losses, reset here
-        // 2) the gradients accumulate += into grads_memory, reset here
+        // Two accumulation buffers need to be zeroed:
+        // 1) acts.losses: Accumulates per-token losses across micro-steps
+        // 2) grads_memory: Accumulates parameter gradients across micro-steps
         cudaCheck(cudaMemsetAsync(model->acts.losses, 0, model->batch_size * model->seq_len * sizeof(float), main_stream));
         cudaCheck(cudaMemsetAsync(model->grads_memory, 0, model->num_parameters * sizeof(floatX), main_stream));
     }
 
-    // convenience shortcuts, size_t instead of int so that pointer arithmetics don't overflow
+    // Extract model dimensions (use size_t to avoid overflow in large models)
     const size_t B = model->batch_size;
     const size_t T = model->seq_len;
     const size_t V = model->config.vocab_size;
@@ -810,42 +1366,73 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
     const size_t NH = model->config.num_heads;
     const size_t C = model->config.channels;
 
-    ParameterTensors params = model->params; // for brevity
+    // Extract pointers for convenience
+    ParameterTensors params = model->params;
     ParameterTensors grads = model->grads;
     ActivationTensors acts = model->acts;
 
-    // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
+    // ========== STEP 1: Compute Loss and Gradient of Logits ==========
+    // The fused classifier combines multiple operations for efficiency:
+    // 1. Compute cross-entropy loss for each token
+    // 2. Accumulate losses into acts.losses
+    // 3. Compute gradient dL/d(logits) and store in acts.output
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+
+    // Loss scaling factor to get mean loss across all tokens and micro-steps
+    // We divide by (B * T * grad_accum_steps) so gradients are properly averaged
+    const float dloss = 1.0f / (float)(B * T * grad_accum_steps);
+
+    // Copy target token IDs from CPU to GPU
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
-    tokenCheck(targets, B*T, V);
+    tokenCheck(targets, B*T, V);  // Validate targets while copy is in progress
+
+    // FUSED CLASSIFIER KERNEL:
+    // - Forward: Computes softmax and cross-entropy loss
+    // - Backward: Computes dL/d(logits) = softmax_probs - one_hot(targets)
+    // - Acts.output now contains gradients instead of logits
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
 
-    // backward pass: go in the reverse order of the forward pass, and call backward() functions
+    // ========== STEP 2: Initialize Backward Pass ==========
+    // Backward pass proceeds in reverse order of forward pass
+    // We'll accumulate gradients flowing back through the residual stream
 
-    // reset residual stream gradients (put here to work with gradient accumulation)
-    floatX* dresidual = (floatX*)model->acts.scratch_btc; // the main buffer holding the gradient in the backward pass
+    // Main gradient buffer: holds dL/d(hidden_states) flowing through network
+    // Uses scratch_btc buffer to save memory
+    floatX* dresidual = (floatX*)model->acts.scratch_btc;
     cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
-    // re-use the output buffer of the forward pass as a scratchpad during backward pass
-    float*  scratchF = (float*)acts.output;
-    floatX* scratchX = (floatX*)acts.output;
+    // Reuse acts.output as scratch space for backward pass
+    // Forward pass no longer needs the logits, backward pass wrote dlogits there
+    float*  scratchF = (float*)acts.output;   // For FP32 scratch operations
+    floatX* scratchX = (floatX*)acts.output;  // For mixed-precision scratch operations
 
-    // we kick off the chain rule by filling in dlosses with 1.0f/(B*T)
-    // this was done in the fused classifier kernel as last step of forward pass
-    // technically that is a small, inline backward() pass of calculating
-    // total, final loss as the mean over all losses over all (B,T) positions in the batch
-    // next: backward the classifier matmul
+    // ========== STEP 3: Backpropagate Through Output Projection ==========
+    // The gradient chain starts from dL/d(logits) computed by fused_classifier
+    // Now we backpropagate through: logits = lnf @ wte^T
+
+    // Compute gradients for final projection (classifier head)
+    // - model->acts.scratch_bt4c receives dL/d(lnf)
+    // - grads.wte receives dL/d(wte) [accumulated because embeddings are shared]
+    // Input gradient: acts.output (dL/d(logits))
     matmul_backward(model->acts.scratch_bt4c, grads.wte, NULL, acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp, main_stream);
-    // backward the final layernorm
-    floatX* residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
+
+    // ========== STEP 4: Backpropagate Through Final LayerNorm ==========
+    // Get the input to final LayerNorm (output of last transformer layer)
+    floatX* residual = acts.residual3 + (L-1) * B * T * C;
+
+    // Compute gradients for final LayerNorm
+    // - dresidual receives dL/d(residual3) - gradient flowing into last layer
+    // - grads.lnfw, grads.lnfb receive dL/d(lnfw), dL/d(lnfb) - LayerNorm param gradients
+    // Input gradient: model->acts.scratch_bt4c (dL/d(lnf))
     layernorm_backward(dresidual, grads.lnfw, grads.lnfb, scratchF, model->acts.scratch_bt4c, residual, params.lnfw, acts.lnf_mean, acts.lnf_rstd, B, T, C, main_stream);
 
-    // from this point on, we no longer need the values stored in the last residual, so we can reuse that memory as generic
-    // scratch for backward computations
+    // MEMORY REUSE OPTIMIZATION:
+    // The last layer's residual3 buffer is no longer needed, reuse it as scratch space
     floatX* dl_btc = residual;
 
-    // now backward all the layers
+    // ========== STEP 5: Backpropagate Through Transformer Layers ==========
+    // Process layers in reverse order (L-1 down to 0)
+    // Each layer: Backprop through feedforward block, then attention block
     for (int l = L-1; l >= 0; l--) {
         NvtxRange layer_range("Layer", l);
 
@@ -1032,15 +1619,67 @@ float gpt2_calculate_grad_norm(GPT2 *model, MultiGpuConfig* multi_gpu_config) {
     return grad_norm_cpu;
 }
 
+// ============================================================================
+// Optimizer: AdamW Weight Update
+// ============================================================================
+
+/*
+ * gpt2_update: Update model parameters using the AdamW optimizer
+ *
+ * PARAMETERS:
+ *   model              - GPT2 model with computed gradients
+ *   learning_rate      - Learning rate (alpha), typically 3e-4 to 6e-4 for GPT-2
+ *   beta1              - Exponential decay rate for first moment (momentum), typically 0.9
+ *   beta2              - Exponential decay rate for second moment (RMSprop), typically 0.95 or 0.999
+ *   eps                - Small constant for numerical stability, typically 1e-8
+ *   weight_decay       - L2 regularization coefficient, typically 0.1
+ *   grad_scale         - Gradient scaling factor (for gradient clipping)
+ *   t                  - Current optimization step (1-indexed for bias correction)
+ *   multi_gpu_config   - Multi-GPU configuration for ZeRO optimizer sharding
+ *   init_from_master_only - If true, only copy master weights to params (skip gradient update)
+ *
+ * ADAMW ALGORITHM:
+ *   AdamW is Adam with decoupled weight decay (better than L2 regularization)
+ *   For each parameter theta:
+ *     1. m_t = beta1 * m_{t-1} + (1 - beta1) * gradient
+ *     2. v_t = beta2 * v_{t-1} + (1 - beta2) * gradient^2
+ *     3. m_hat = m_t / (1 - beta1^t)  [bias correction]
+ *     4. v_hat = v_t / (1 - beta2^t)  [bias correction]
+ *     5. theta_t = theta_{t-1} - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * theta_{t-1})
+ *
+ * MIXED PRECISION TRAINING:
+ *   - Parameters (params): BF16/FP16 for fast computation
+ *   - Gradients (grads): BF16/FP16 (computed in same precision as forward/backward)
+ *   - Optimizer state (m, v): FP32 for numerical stability
+ *   - Master weights (optional): FP32 copy of params for accurate updates
+ *
+ *   UPDATE FLOW WITH MASTER WEIGHTS:
+ *     1. Compute update in FP32: delta = AdamW(grad_fp32, m, v)
+ *     2. Apply to master weights: master_weights -= lr * delta
+ *     3. Round down to BF16/FP16: params = (floatX) master_weights
+ *
+ * MULTI-GPU OPTIMIZER SHARDING (ZeRO Stage 1):
+ *   - Each GPU only stores optimizer state (m, v, master_weights) for a shard of parameters
+ *   - Reduces memory: 4x to 8x less optimizer memory per GPU
+ *   - After update, AllGather broadcasts updated params to all GPUs
+ *   - Gradients are already reduced/sharded by gpt2_backward_and_reduce
+ *
+ * SELECTIVE WEIGHT DECAY:
+ *   Weight decay is only applied to 2D weight matrices (not biases or LayerNorm params)
+ *   Applied to: wte, wpe, qkvw, attprojw, fcw, fcprojw
+ *   Not applied to: biases (qkvb, attprojb, fcb, fcprojb) and LayerNorm (ln1w, ln1b, ln2w, ln2b, lnfw, lnfb)
+ *
+ * STOCHASTIC ROUNDING:
+ *   When converting FP32 master weights to BF16/FP16, we use stochastic rounding
+ *   instead of round-to-nearest. This prevents systematic rounding bias during training.
+ *   Uses model->rng_state for reproducibility.
+ */
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, float grad_scale, int t,
                  MultiGpuConfig* multi_gpu_config, bool init_from_master_only=false) {
-    // update the model parameters using the AdamW optimizer
-    // keep in mind that optimizer sharding (ZeRO-1) assigns different parameters to different GPUs
-    // so we may not be responsible for the entire parameter tensor
-    // also, this function was very simple a while back but become very complex, only because we want to
-    // selectively weight decay some, but not all tensors :(
-    // TODO: revisit and probably refactor this entire function
+    // NVTX profiling marker
     NVTX_RANGE_FN();
+
+    // Validate optimizer state is allocated
     if(model->grads_memory == nullptr || model->m_memory == nullptr || model->v_memory == nullptr) {
         fprintf(stderr, "Need to allocate optimizer state before update");
         exit(EXIT_FAILURE);
@@ -1416,12 +2055,78 @@ void error_usage() {
 
 // ----------------------------------------------------------------------------
 // main training loop
+// ============================================================================
+// Main Training Loop
+// ============================================================================
+
+/*
+ * PROGRAM OVERVIEW:
+ * This is the main entry point for GPT-2 training on GPU using CUDA.
+ * The program implements a complete training loop with the following features:
+ *
+ * TRAINING LOOP STRUCTURE:
+ *   For each training step:
+ *     1. Load batch of data (input tokens and target tokens)
+ *     2. Forward pass: Compute predictions and loss
+ *     3. Backward pass: Compute gradients via backpropagation
+ *     4. Optimizer step: Update weights using AdamW
+ *     5. Periodically: Validation, checkpointing, text generation
+ *
+ * GRADIENT ACCUMULATION:
+ *   To simulate larger batch sizes when GPU memory is limited:
+ *   - Run multiple forward/backward passes (micro-batches)
+ *   - Accumulate gradients across micro-batches
+ *   - Update weights once after all micro-batches
+ *   - Effective batch size = micro_batch_size * num_gpus * grad_accum_steps
+ *
+ * MULTI-GPU TRAINING:
+ *   Supports data parallelism and ZeRO optimizer sharding:
+ *   - Data parallel: Each GPU processes different data, gradients averaged
+ *   - ZeRO Stage 1: Optimizer states sharded across GPUs (saves memory)
+ *   - Uses NCCL for efficient GPU-to-GPU communication
+ *
+ * CHECKPOINTING:
+ *   Periodically saves training state to disk:
+ *   - Model weights (params)
+ *   - Optimizer state (m, v, master_weights)
+ *   - Training progress (step number, RNG state)
+ *   - Can resume training from any checkpoint
+ *
+ * MIXED PRECISION:
+ *   Uses BF16/FP16 for computation, FP32 for optimizer state:
+ *   - Faster training (2-3x speedup on modern GPUs)
+ *   - Reduced memory usage (2x less for activations and parameters)
+ *   - Maintains accuracy with FP32 master weights
+ *
+ * MEMORY OPTIMIZATIONS:
+ *   - Gradient checkpointing: Recompute activations during backward
+ *   - Kernel fusion: Combine operations to reduce memory bandwidth
+ *   - Activation reuse: Share memory buffers across layers
+ *
+ * COMMAND LINE ARGUMENTS:
+ *   -i: Training data pattern (e.g., "data/train*.bin")
+ *   -j: Validation data pattern
+ *   -e: Model weights to load (checkpoint or descriptor like "d12" for 12-layer GPT-2)
+ *   -o: Output directory for logs and checkpoints
+ *   -b: Per-GPU batch size (micro-batch size)
+ *   -t: Sequence length (T)
+ *   -d: Total batch size across all GPUs and gradient accumulation
+ *   -l: Learning rate
+ *   -c: Weight decay coefficient
+ *   -x: Maximum training steps
+ *   -v: Validation frequency (steps)
+ *   -r: Recompute mode (0=none, 1=GELU, 2=GELU+LayerNorm)
+ *   -w: Use FP32 master weights (1=yes, 0=no)
+ *   -z: ZeRO stage (0=disabled, 1=optimizer state sharding)
+ *   See error_usage() for complete list of arguments
+ */
 int main(int argc, char *argv[]) {
-    // read in the (optional) command line arguments
+    // ========== Command Line Arguments ==========
+    // Default values for training configuration
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
-    const char* lr_scheduler_type = "cosine";
+    const char* load_filename = "gpt2_124M_bf16.bin"; // BF16 weights of the model
+    const char* lr_scheduler_type = "cosine";  // Learning rate schedule: "cosine", "linear", "constant"
     const char* output_log_dir = NULL;
     int checkpoint_every = 0; // write checkpoints every how many steps?
     int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)

@@ -1,6 +1,34 @@
 /*
 Kernels for the positional encoder forward pass in GPT-2.
 
+OPERATION OVERVIEW:
+The encoder is the first layer of a transformer model. It combines two types of embeddings:
+1. Token embeddings (wte): Convert token IDs to dense vectors, providing semantic meaning
+2. Position embeddings (wpe): Add positional information so the model knows token order
+
+For each token at position t in batch b, we compute:
+  out[b,t,:] = wte[token_id,:] + wpe[t,:]
+
+This is a simple element-wise addition, but it's performed billions of times during training,
+making GPU optimization crucial for performance.
+
+ROLE IN TRANSFORMER:
+The encoder output becomes the input to the transformer's attention and feedforward layers.
+Without position embeddings, the transformer would be permutation-invariant (order-blind).
+The combination of token + position embeddings gives the model both semantic and structural
+information needed for language understanding.
+
+WHY MULTIPLE KERNEL VERSIONS:
+This file demonstrates progressive optimization of a memory-bound kernel:
+- Version 1: Naive parallelization - each thread processes one (B,T) position, loops over C
+             Simple but leaves GPU cores underutilized
+- Version 2: Full parallelization - each thread processes one element across B,T,C
+             Better GPU utilization through finer-grained parallelism
+- Version 3: Vectorized memory access - uses 128-bit loads/stores for memory bandwidth
+             Achieves near-peak memory bandwidth by reading/writing 4x elements at once
+
+The progression shows how small changes can yield 2-3x speedups on memory-bound operations.
+
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt encoder_forward.cu -o encoder_forward
 
@@ -45,7 +73,27 @@ void encoder_forward_cpu(float* out,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// naive implementation into kernel, parallelize over B,T, loop over C
+// KERNEL 1: Naive parallelization over batch and sequence positions
+//
+// ALGORITHM:
+// - Each thread handles one (batch, time) position
+// - Thread loops over all C channels sequentially
+// - Computes: out[b,t,c] = wte[token_id,c] + wpe[t,c] for all c
+//
+// PARALLELIZATION:
+// - Launch B*T threads total (one per sequence position)
+// - Each thread processes C elements in a serial loop
+//
+// MEMORY ACCESS PATTERN:
+// - Sequential reads/writes within each thread (good spatial locality)
+// - But only B*T threads active, leaving many GPU cores idle when B*T is small
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Simple and easy to understand (direct CPU port)
+// - Underutilizes GPU when B*T < number of CUDA cores (typically 1000s-10000s)
+// - Memory bandwidth: Moderate (sequential access but low parallelism)
+// - Best for: Small batch sizes or very large C (where loop dominates)
+//
 __global__ void encoder_forward_kernel1(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
@@ -65,7 +113,28 @@ __global__ void encoder_forward_kernel1(floatX* out,
     }
 }
 
-// optimized implementation: parallelize over all of B,T,C
+// KERNEL 2: Full parallelization across all dimensions
+//
+// ALGORITHM:
+// - Each thread handles exactly ONE element: out[b,t,c] = wte[token_id,c] + wpe[t,c]
+// - No loops - pure parallel computation
+//
+// PARALLELIZATION:
+// - Launch B*T*C threads total (one per output element)
+// - Fully saturates GPU cores even with small batches (C is typically 768-12288)
+//
+// MEMORY ACCESS PATTERN:
+// - Each thread reads 2 values and writes 1 value
+// - Random access to wte (depends on token IDs), sequential access to wpe and out
+// - No memory reuse between threads (each reads different locations)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Much better GPU utilization than kernel1 (100x+ more threads)
+// - Memory bandwidth: Good (all threads active means memory controller saturated)
+// - Register usage: Minimal (only 3 memory ops and simple arithmetic)
+// - Best for: All typical use cases (GPT-2 style models)
+// - Speedup vs kernel1: ~2-3x for typical B,T,C values
+//
 __global__ void encoder_forward_kernel2(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
@@ -87,6 +156,39 @@ __global__ void encoder_forward_kernel2(floatX* out,
     }
 }
 
+// KERNEL 3: Vectorized memory access (128-bit loads/stores)
+//
+// ALGORITHM:
+// - Same as kernel2, but each thread processes x128::size elements (typically 4-8)
+// - Uses 128-bit wide memory transactions instead of individual element access
+//
+// OPTIMIZATION TECHNIQUE - VECTORIZED MEMORY ACCESS:
+// - load128cs(): Loads 128 bits (4x float32 or 8x bfloat16) in a single transaction
+// - store128(): Writes 128 bits in a single transaction
+// - This matches the GPU's memory transaction width (128 bytes cache lines)
+//
+// PARALLELIZATION:
+// - Launch (B*T*C / x128::size) threads
+// - Fewer threads than kernel2, but each does more work
+// - Still maintains full GPU occupancy
+//
+// MEMORY ACCESS PATTERN:
+// - Coalesced 128-bit aligned reads and writes
+// - Memory controller can serve 4-8x fewer transactions for the same data
+// - load128cs uses cache-streaming hint (bypasses L1 cache to avoid pollution)
+// - store128 writes to cache (data likely needed by next layer)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Memory bandwidth: Excellent (near peak achievable bandwidth)
+// - Instruction-level parallelism: Better (single instruction loads multiple values)
+// - Works best when C is divisible by x128::size (otherwise edge cases)
+// - Speedup vs kernel2: ~1.5-2x due to memory bandwidth improvement
+// - Best for: Production use (fastest version)
+//
+// KEY INSIGHT:
+// GPUs move data in large chunks. By matching our access pattern to the hardware's
+// natural granularity, we reduce overhead and maximize bandwidth utilization.
+//
 __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {

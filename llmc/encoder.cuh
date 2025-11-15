@@ -1,7 +1,73 @@
 /*
-The GPT-2 Encoder, which combines two encodings: token and position
-In the forward pass, both encodings are added together
-In the backward pass, the gradients flow to both, handled by different kernels
+==============================================================================
+Encoder Layer - Token and Positional Embeddings
+==============================================================================
+
+PURPOSE:
+This file implements the embedding layer for transformer models (GPT-2 style),
+which combines two types of encodings:
+  1. Token embeddings (wte): Map each input token ID to a learnable vector
+  2. Positional embeddings (wpe): Add position-dependent information to each token
+
+MATHEMATICAL OPERATION:
+For input token IDs inp[b, t] at batch b, position t:
+  out[b, t, c] = wte[inp[b, t], c] + wpe[t, c]
+
+This is the first operation in a transformer, converting discrete token IDs
+into continuous vector representations that encode both semantic meaning (from
+wte) and positional information (from wpe).
+
+FORWARD PASS:
+- Input: Token IDs (B, T) + embedding tables wte(V, C) and wpe(T, C)
+- Output: Combined embeddings (B, T, C)
+- Each thread processes x128::size elements (8 for BF16, enabling vectorization)
+- Uses load128cs to stream data through cache without polluting it
+
+BACKWARD PASS:
+Gradients from upstream flow back to both embedding tables:
+
+1. WPE (Position Embeddings) Backward:
+   - Deterministic: Each position accumulates gradients across the batch
+   - Each thread handles x128::size channels for a specific (t, c) position
+   - Accumulates across batch dimension B without atomics
+   - Uses stochastic rounding when converting FP32 accumulator to BF16/FP8
+
+2. WTE (Token Embeddings) Backward:
+   - More complex due to non-uniform token distribution
+   - Uses bucket-based approach for determinism and load balancing:
+     * Bucket = (vocabulary_index, channel_group)
+     * CPU pre-processes inputs to create buckets and sort by size
+     * Each warp handles WARP_SIZE * x128::size channels (256 for BF16)
+     * Largest buckets processed first to minimize GPU idle time
+   - Within each bucket:
+     * Multiple batch-time positions may map to same token
+     * Each warp accumulates gradients for all occurrences
+     * Results combined in shared memory, then written to global memory
+   - Fully deterministic (no race conditions or atomics)
+
+MEMORY ACCESS PATTERNS:
+- Forward: Coalesced reads from wte and wpe, coalesced writes to out
+- Backward WPE: Coalesced reads from dout, single write per position
+- Backward WTE: Scattered reads from dout (based on token distribution),
+  accumulated in shared memory, single write per vocabulary entry
+
+OPTIMIZATIONS:
+1. Vectorized loads/stores using x128 (processes 8 BF16 values at once)
+2. Streaming cache hints (__ldcs/__stcs) to avoid cache pollution
+3. Bucket-based load balancing for non-uniform token distributions
+4. Stochastic rounding for low-precision training (BF16/FP8)
+5. CPU/GPU overlap: WPE kernel launches while CPU prepares WTE buckets
+
+PERFORMANCE CONSIDERATIONS:
+- Forward pass is memory-bandwidth bound (simple addition)
+- WPE backward is efficient due to uniform access pattern
+- WTE backward efficiency depends on vocabulary usage distribution
+- Bucket sorting on CPU ensures balanced GPU workload
+- Determinism achieved without performance loss (no atomics needed)
+
+REFERENCES:
+- Attention Is All You Need (Vaswani et al., 2017) - Introduced positional embeddings
+- GPT-2 (Radford et al., 2019) - Uses learned positional embeddings
 */
 #include <assert.h>
 #include <stdint.h>

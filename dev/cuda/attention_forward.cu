@@ -1,65 +1,161 @@
 /*
-Kernels for attention forward pass.
+================================================================================
+ATTENTION FORWARD PASS - MULTI-KERNEL PERFORMANCE EXPLORATION
+================================================================================
 
-If you do not have CUDNN, you can remove ENABLE_CUDNN to run the other kernels
+PURPOSE:
+This file implements multiple versions of the multi-head attention forward pass
+for educational and benchmarking purposes. Each kernel version explores different
+optimization strategies and performance tradeoffs in CUDA programming.
 
-See the README for cuDNN install instructions
+WHY MULTIPLE VERSIONS EXIST:
+Attention is a critical bottleneck in transformer models, and optimizing it requires
+understanding various CUDA programming techniques. This file demonstrates the
+evolution from naive implementations to highly optimized kernels, showing how
+different approaches impact performance:
+- Memory access patterns (coalesced vs scattered)
+- Computation patterns (parallel vs sequential)
+- Use of hardware features (tensor cores, warp primitives, shared memory)
+- Numerical precision tradeoffs (FP32 vs FP16/BF16)
+- Fusion opportunities (combining operations to reduce memory traffic)
 
-Compile example with cuDNN:
+ATTENTION ALGORITHM OVERVIEW:
+Multi-head attention computes weighted combinations of values based on query-key
+similarity scores. For each position in a sequence:
+
+1. SCORE COMPUTATION (QK^T):
+   - Compute dot products between query at current position and all keys
+   - Scale by 1/sqrt(head_dimension) for numerical stability
+   - Result: attention scores (logits) for each position pair
+
+2. SOFTMAX NORMALIZATION:
+   - Apply softmax to scores to get attention weights (probabilities)
+   - For autoregressive (causal) attention, mask future positions
+   - Uses numerically stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))
+
+3. WEIGHTED VALUE AGGREGATION (Attention @ V):
+   - Multiply attention weights by corresponding value vectors
+   - Sum weighted values to produce output for current position
+
+4. MULTI-HEAD OPERATION:
+   - Split input into multiple heads (different representation subspaces)
+   - Run attention independently on each head
+   - Concatenate head outputs
+
+Input shape: (B, T, 3C) where B=batch, T=sequence_length, C=channels
+- Contains Q, K, V packed together (3C = C for Q + C for K + C for V)
+Output shape: (B, T, C)
+Intermediate shapes: preatt/att are (B, NH, T, T) where NH=num_heads
+
+COMPILATION:
+With cuDNN:
 nvcc -I/PATH/TO/cudnn-frontend/include -DENABLE_CUDNN -O3 --use_fast_math --lcublas -lcublasLt -lcudnn attention_forward.cu -o attention_forward
 
-Compile example without cuDNN:
+Without cuDNN:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt attention_forward.cu -o attention_forward
 
-version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
+KERNEL VERSIONS:
+
+VERSION 1: Naive GPU Port
 ./attention_forward 1
+- Direct translation of CPU code to CUDA
+- Parallelizes only over (batch, time, heads)
+- Inner loops over head_size remain sequential within each thread
+- Memory-bound: Poor memory access patterns, no coalescing
+- Performance: Baseline (slowest)
+- Use case: Understanding basic GPU parallelization
 
-version 2 is a naive implementation of flash attention, taken, adapted from
-https://github.com/tspeterkim/flash-attention-minimal
-and with help from
-https://github.com/leloykun/flash-hyperbolic-attention-minimal
-sadly, this flash attention version seems about 3X slower than the naive version
+VERSION 2: Flash Attention (Minimal)
 ./attention_forward 2
+- Implements tiling to keep data in SRAM (shared memory)
+- Uses online softmax algorithm to avoid materializing full attention matrix
+- Reduces HBM (global memory) accesses significantly
+- UNFORTUNATELY: This implementation is ~3X slower than naive version
+- Reason: Overhead from complex indexing and synchronization outweighs benefits
+- Based on: https://github.com/tspeterkim/flash-attention-minimal
+- Use case: Educational - shows that algorithmic improvements need careful implementation
 
-version 3 is a cuBLAS + softmax version, similar to the PyTorch implementation
-cuBLAS is used both to calculate the QK^T and the final weighted sum
-the softmax is calculated using a custom, efficient kernel as well
-this turns out to be ~20X faster than (1) nice
+VERSION 3: cuBLAS + Custom Softmax
 ./attention_forward 3
+- Uses highly optimized cuBLAS library for matrix multiplications
+- Custom kernel for softmax (efficient warp-level reductions)
+- Pipeline: permute -> cuBLAS(QK^T) -> scale -> softmax -> cuBLAS(Att@V) -> unpermute
+- Memory-bound but with optimized memory access patterns
+- Performance: ~20X faster than version 1
+- Use case: Production baseline - leverages vendor-optimized libraries
 
-version 4 is a further optimized kernel that fuses the scale operation,
-uses a directly autoregressive softmax, and uses the online softmax algorithm.
+VERSION 4: Fused Operations + Online Softmax
 ./attention_forward 4
+- Fuses scaling into softmax kernel (one less memory roundtrip)
+- Uses online softmax algorithm (updates max/sum incrementally)
+- Autoregressive masking built directly into softmax
+- Reduces kernel launches and memory traffic
+- Performance: Further improvement over version 3
+- Use case: Understanding kernel fusion benefits
 
-version 5 is a FP16 version of kernel 4
+VERSION 5: FP16 Mixed Precision
 ./attention_forward 5
+- Same algorithm as version 4 but uses FP16/BF16 for storage and compute
+- Enables use of Tensor Cores on modern GPUs (Volta+)
+- Reduces memory bandwidth requirements by 2X
+- Includes FP32<->FP16 conversions for validation
+- Trade-off: Slight accuracy loss for significant speedup
+- Performance: Significantly faster on Tensor Core GPUs
+- Use case: Production on modern hardware
 
-version 6 is kernel 5 skipping (un)permute (unrealistic but useful comparison point)
+VERSION 6: FP16 Without Permutes (Unrealistic)
+./attention_forward 6
+- Same as version 5 but skips permute/unpermute on perf runs
+- Useful for isolating permutation overhead
+- Not realistic for actual usage
+- Use case: Performance analysis only
 
-version 10 is using cuDNN Flash Attention using FP16 or BF16, see:
-https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
+VERSION 10: cuDNN Flash Attention
 ./attention_forward 10
+- Uses NVIDIA's cuDNN library flash attention implementation
+- Highly optimized by NVIDIA engineers for specific GPU architectures
+- Handles FP16/BF16 natively with custom strides (no explicit permute needed)
+- May use special hardware features not accessible via CUDA
+- Performance: Typically fastest on supported hardware
+- Use case: Production when cuDNN is available
+- Reference: https://github.com/NVIDIA/cudnn-frontend/blob/main/docs/operations/Attention.md
 
-version 11 is kernel 10 skipping FP16/FP32 conversions (full FP16/BF16 network)
+VERSION 11: cuDNN Full Low Precision
 ./attention_forward 11
+- Same as version 10 but assumes entire network is FP16/BF16
+- Skips FP32<->FP16 conversions
+- Use case: End-to-end low precision networks
 */
 //#define ENABLE_CUDNN // can be enabled via nvcc "-DENABLE_CUDNN"
+
+// ----------------------------------------------------------------------------
+// Standard library includes
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include <float.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include <float.h>              // For FLT_MAX constant
 
-#define ENABLE_BF16
-#include "common.h"
+// ----------------------------------------------------------------------------
+// CUDA library includes
+#include <cublas_v2.h>          // cuBLAS: NVIDIA's BLAS (Basic Linear Algebra Subprograms) library
+                                // Provides highly optimized matrix multiplication (GEMM) routines
+#include <cuda_runtime.h>       // CUDA runtime API for memory management, kernel launches, etc.
+#include <cuda_bf16.h>          // BFloat16 data type support (16-bit floating point)
+#include <cooperative_groups.h> // Cooperative Groups API for warp-level and block-level primitives
+#include <cooperative_groups/reduce.h> // Warp-level reduction operations (sum, max, etc.)
+
+// ----------------------------------------------------------------------------
+// Project-specific includes
+#define ENABLE_BF16             // Enable BFloat16 support in common.h
+#include "common.h"             // Common utilities: error checking, memory helpers, benchmarking
+                                // Defines floatX as either __nv_bfloat16 or half depending on config
+                                // Provides cudaCheck, cublasCheck macros for error handling
+                                // Includes ceil_div, make_random_float, validate_result utilities
 
 // ----------------------------------------------------------------------------
 // CUDA & cuDNN setup
-static bool first_run_validation = true; // always run e.g. permute on 1st run
+static bool first_run_validation = true; // Always run validation steps (e.g. permute) on first run
+                                           // to ensure correctness, then skip on subsequent runs
 
 #ifdef ENABLE_CUDNN
 #include <cudnn_frontend.h>
@@ -79,72 +175,102 @@ static void* cudnn_workspace = NULL;
 #endif // ENABLE_CUDNN
 // ----------------------------------------------------------------------------
 // CPU code reference
+// This reference implementation is used for correctness validation of GPU kernels
+// It implements the standard multi-head attention algorithm in a straightforward way
 
 void attention_forward_cpu(float* out, float* preatt, float* att,
                        const float* inp,
                        int B, int T, int C, int NH) {
-    // input is (B, T, 3C) Q,K,V
-    // preatt, att are (B, NH, T, T)
-    // output is (B, T, C)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.0 / sqrtf(hs);
+    // Input shapes:
+    //   inp: (B, T, 3C) - batch, sequence length, 3*channels (Q,K,V concatenated)
+    //   preatt: (B, NH, T, T) - pre-softmax attention scores (for debugging/backward)
+    //   att: (B, NH, T, T) - post-softmax attention weights
+    //   out: (B, T, C) - output after applying attention to values
+    //
+    // B = batch size, T = sequence length, C = channels (embedding dimension)
+    // NH = number of attention heads, hs = head size = C / NH
 
+    int C3 = C*3;            // Total size including Q, K, V
+    int hs = C / NH;         // head size - dimension of each attention head
+    float scale = 1.0 / sqrtf(hs);  // Scaling factor for attention scores
+                                     // Prevents softmax from saturating for large head dimensions
+
+    // Outer loops iterate over batch, sequence positions, and attention heads
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
+                // Locate query vector for current position t and head h
+                // inp layout: [batch][time][qkv=0..2][head][head_dim]
                 const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+
+                // Pointers to attention score arrays for this (batch, head, time) position
                 float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
-                // pass 1: calculate query dot key and maxval
+                // PASS 1: Compute Query @ Key^T (attention scores)
+                // For autoregressive/causal attention, only attend to current and previous positions
+                // Also track maximum value for numerically stable softmax
                 float maxval = -FLT_MAX;
-                for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                for (int t2 = 0; t2 <= t; t2++) {  // Only up to current position (causal mask)
+                    // Locate key vector for position t2 and head h
+                    // +C offset because keys come after queries in the concatenated layout
+                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C;
 
-                    // (query_t) dot (key_t2)
+                    // Compute dot product: query_t · key_t2
                     float val = 0.0f;
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
                     }
-                    val *= scale;
+                    val *= scale;  // Scale by 1/sqrt(head_size) for numerical stability
+
+                    // Track maximum for stable softmax computation
                     if (val > maxval) {
                         maxval = val;
                     }
 
-                    preatt_bth[t2] = val;
+                    preatt_bth[t2] = val;  // Store pre-softmax attention score
                 }
-                // pad with -INFINITY outside of autoregressive region for debugging comparisons
+
+                // Pad with -INFINITY for positions beyond current (future positions)
+                // Not strictly necessary but makes debugging easier and matches PyTorch output
                 for (int t2 = t+1; t2 < T; t2++) {
                     preatt_bth[t2] = -INFINITY;
                 }
 
-                // pass 2: calculate the exp and keep track of sum
+                // PASS 2: Compute exp and accumulate sum (numerically stable softmax part 1)
+                // Softmax formula: exp(x - max(x)) / sum(exp(x - max(x)))
+                // Subtracting max prevents overflow and improves numerical stability
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
                     expsum += expv;
-                    att_bth[t2] = expv;
+                    att_bth[t2] = expv;  // Store unnormalized exp values
                 }
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
-                // pass 3: normalize to get the softmax
+                // PASS 3: Normalize to get final softmax probabilities
                 for (int t2 = 0; t2 < T; t2++) {
                     if (t2 <= t) {
-                        att_bth[t2] *= expsum_inv;
+                        att_bth[t2] *= expsum_inv;  // Divide by sum to get probabilities
                     } else {
-                        // causal attention mask. not strictly necessary to set to zero here
-                        // only doing this explicitly for debugging and checking to PyTorch
+                        // Causal attention mask - future positions get zero attention weight
+                        // This is redundant (already -INFINITY in preatt) but explicit for clarity
                         att_bth[t2] = 0.0f;
                     }
                 }
 
-                // pass 4: accumulate weighted values into the output of attention
+                // PASS 4: Compute weighted sum of values (Attention @ V)
+                // out = sum_t2( att[t, t2] * value[t2] )
                 float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }  // Initialize output
+
                 for (int t2 = 0; t2 <= t; t2++) {
-                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float att_btht2 = att_bth[t2];
+                    // Locate value vector for position t2 and head h
+                    // +C*2 offset because values come after queries and keys
+                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                    float att_btht2 = att_bth[t2];  // Attention weight for this position
+
+                    // Accumulate weighted value into output
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
@@ -155,182 +281,273 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 }
 
 // ----------------------------------------------------------------------------
-// GPU kernels
+// GPU kernels - VERSION 1 (Naive)
+// These kernels are direct ports of the CPU code to GPU, with minimal optimization.
+// Each kernel handles one stage of the attention pipeline.
 
+/*
+KERNEL: attention_query_key_kernel1
+PURPOSE: Compute Q @ K^T (attention scores before softmax)
+APPROACH: Naive parallelization - one thread per element of output matrix
+PARALLELIZATION: Over (batch, head, query_pos, key_pos)
+PERFORMANCE CHARACTERISTICS:
+  - Memory-bound: Poor memory access patterns
+  - No coalescing: Each thread reads different scattered locations
+  - Sequential inner loop over head_size dimension
+  - Inefficient: Each query vector is loaded T times (once per key position)
+OPTIMIZATION OPPORTUNITIES:
+  - Use shared memory to cache query/key vectors
+  - Coalesce memory accesses by reorganizing thread mapping
+  - Use warp-level primitives for dot product reduction
+  - Fuse with subsequent operations to reduce memory traffic
+*/
 __global__ void attention_query_key_kernel1(float* preatt, const float* inp,
                                            int B, int T, int C, int NH) {
+    // Global thread index - each thread computes one element of the (B, NH, T, T) output
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * NH * T * T;
 
     if (idx < total_threads) {
-        int t2 = idx % T;
-        int t = (idx / T) % T;
+        // Decode linear index into 4D coordinates (b, h, t, t2)
+        // where t is query position, t2 is key position
+        int t2 = idx % T;                    // Key position
+        int t = (idx / T) % T;               // Query position
+
+        // Apply causal mask: prevent attending to future positions
         if (t2 > t) {
-            // autoregressive mask
             preatt[idx] = -INFINITY;
             return;
         }
-        int h = (idx / (T * T)) % NH;
-        int b = idx / (NH * T * T);
+
+        int h = (idx / (T * T)) % NH;        // Head index
+        int b = idx / (NH * T * T);          // Batch index
 
         int C3 = C*3;
         int hs = C / NH; // head size
+
+        // Locate query and key vectors
+        // PERFORMANCE NOTE: These pointer calculations involve scattered memory access
         const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
         const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
-        // (query_t) dot (key_t2)
+        // Compute dot product: query_t · key_t2
+        // PERFORMANCE NOTE: This loop is sequential - no parallelization within thread
+        // Better approach would use warp shuffle or shared memory reductions
         float val = 0.0f;
         for (int i = 0; i < hs; i++) {
             val += query_t[i] * key_t2[i];
         }
-        val *= 1.0 / sqrtf(hs);
+        val *= 1.0 / sqrtf(hs);  // Scale for numerical stability
 
         preatt[idx] = val;
     }
 }
 
+/*
+KERNEL: attention_softmax_kernel1
+PURPOSE: Apply softmax to attention scores (convert scores to probabilities)
+APPROACH: Naive - one thread per row of attention matrix
+PARALLELIZATION: Over (batch, head, query_position)
+ALGORITHM: Three-pass numerically stable softmax
+  1. Find maximum value (for numerical stability)
+  2. Compute exp(x - max) and sum
+  3. Normalize by dividing by sum
+PERFORMANCE CHARACTERISTICS:
+  - Memory-bound: Multiple passes over same data
+  - Sequential: Each thread processes entire row alone
+  - No parallelization within row
+OPTIMIZATION OPPORTUNITIES:
+  - Use warp-level reductions for max/sum (see softmax_forward_kernel4)
+  - Combine passes to reduce memory traffic
+  - Use online softmax algorithm (see softmax_forward_kernel5)
+*/
 __global__ void attention_softmax_kernel1(float* att, const float* preatt,
                                          int B, int T, int NH) {
+    // One thread per (batch, time, head) - each processes one row of attention matrix
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * T * NH;
 
     if (idx < total_threads) {
-        int h = idx % NH;
-        int t = (idx / NH) % T;
-        int b = idx / (NH * T);
+        // Decode linear index
+        int h = idx % NH;           // Head index
+        int t = (idx / NH) % T;     // Query position (row of attention matrix)
+        int b = idx / (NH * T);     // Batch index
 
+        // Pointers to input/output rows
         const float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
         float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
-        // find maxval
+        // PASS 1: Find maximum value for numerical stability
+        // Prevents overflow in exp() by computing exp(x - max) instead of exp(x)
         float maxval = -FLT_MAX;
-        for (int t2 = 0; t2 <= t; t2++) {
+        for (int t2 = 0; t2 <= t; t2++) {  // Only up to current position (causal)
             if (preatt_bth[t2] > maxval) {
                 maxval = preatt_bth[t2];
             }
         }
 
-        // calculate the exp and keep track of sum
+        // PASS 2: Calculate exp(x - max) and sum for normalization
         float expsum = 0.0f;
         for (int t2 = 0; t2 <= t; t2++) {
             float expv = expf(preatt_bth[t2] - maxval);
             expsum += expv;
-            att_bth[t2] = expv;
+            att_bth[t2] = expv;  // Store unnormalized values
         }
         float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
-        // normalize to get the softmax
+        // PASS 3: Normalize to get final softmax probabilities
         for (int t2 = 0; t2 < T; t2++) {
             if (t2 <= t) {
-                att_bth[t2] *= expsum_inv;
+                att_bth[t2] *= expsum_inv;  // Divide by sum
             } else {
-                // causal attention mask. not strictly necessary to set to zero here
-                // only doing this explicitly for debugging and checking to PyTorch
+                // Causal attention mask - zero out future positions
+                // Not strictly necessary but explicit for debugging
                 att_bth[t2] = 0.0f;
             }
         }
     }
 }
 
-// warp-level reduction for finding the maximum value
+/*
+DEVICE FUNCTION: warpReduceMax
+PURPOSE: Efficiently find maximum value across all threads in a warp
+APPROACH: Tree reduction using warp shuffle instructions
+OPTIMIZATION TECHNIQUES:
+  - Warp shuffle (__shfl_down_sync): Exchange data between threads without shared memory
+  - Tree reduction: O(log n) steps instead of O(n)
+  - No synchronization needed: Warp executes in lockstep (SIMT model)
+EXPLANATION:
+  A warp has 32 threads. We use shuffle to compare values:
+  Step 1 (offset=16): Thread 0 compares with Thread 16, Thread 1 with 17, etc.
+  Step 2 (offset=8):  Thread 0 compares with Thread 8, Thread 1 with 9, etc.
+  ...continuing until offset=1
+  After 5 steps (log2(32)), Thread 0 holds the maximum of all 32 values
+*/
 __device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
+        // __shfl_down_sync: Get value from thread (threadIdx.x + offset) in same warp
+        // 0xFFFFFFFF mask means all threads participate
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
-    return val;
+    return val;  // Only thread 0 has the true maximum, but all threads return a value
 }
 
+/*
+KERNEL: softmax_forward_kernel4
+PURPOSE: Optimized softmax with warp-level reductions and flexible block sizes
+APPROACH: Two-level reduction (warp-level then block-level)
+PARALLELIZATION: One block per row, threads cooperate within block
+ALGORITHM:
+  1. Thread coarsening: Each thread processes multiple elements (stride loop)
+  2. Warp-level reduction: Use shuffle for fast intra-warp reduction
+  3. Block-level reduction: Use shared memory for inter-warp reduction
+PERFORMANCE CHARACTERISTICS:
+  - Much faster than kernel1: Exploits warp-level parallelism
+  - Flexible: Works with any block size (multiple of 32)
+  - Memory efficient: Minimizes shared memory usage
+OPTIMIZATION TECHNIQUES:
+  - Warp shuffle instructions (no shared memory for intra-warp)
+  - Thread coarsening (each thread handles C/blockDim.x elements)
+  - Shared memory for inter-warp communication only
+*/
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
-    // out is (N, C) just like inp. Each row of inp will get softmaxed.
-    // same as kernel3, but can handle any block size (multiple of 32)
-    // each row of C elements is handled by block_size threads
-    // furthermore, each block_size threads get executed in warps of 32 threads
+    // Input/output shape: (N, C) where N = number of rows, C = row length
+    // Each row gets softmax applied independently
+    // One block handles one row, using block_size threads cooperatively
+    // Threads are organized into warps of 32
 
-    // special reduction operations warpReduceMax/warpReduceSum are used for intra-warp reductions
-    // shared memory is used for inter-warp reduction
+    // Shared memory layout: [maxvals for each warp | sumvals for each warp]
     extern __shared__ float shared[];
-    int idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int warpId = threadIdx.x / 32; // warp index within a block
-    int laneId = threadIdx.x % 32; // thread index within a warp
 
-    // the number of warps per block. recall that blockDim.x is block_size
+    int idx = blockIdx.x;              // Which row this block is processing
+    int tid = threadIdx.x;             // Thread index within block
+    int warpId = threadIdx.x / 32;     // Which warp this thread belongs to (0 to warpsPerBlock-1)
+    int laneId = threadIdx.x % 32;     // Position within warp (0 to 31)
+
+    // Calculate number of warps in this block
     int warpsPerBlock = blockDim.x / 32;
 
-    // shared[] must be allocated to have 2 * warpsPerBlock elements
-    // first half for max values, the second half for sum values
+    // Partition shared memory: first half for max values, second half for sums
     float* maxvals = shared;
     float* sumvals = &shared[warpsPerBlock];
 
-    // one row of inp, i.e. inp[idx, :] of shape (C,)
+    // Pointer to the row this block is processing
     const float* x = inp + idx * C;
 
-    // first, thread coarsening by directly accessing global memory in series
+    // STEP 1: Find maximum value in row (for numerical stability)
+    // Thread coarsening: each thread handles multiple elements with stride
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += blockDim.x) {  // Stride by blockDim.x
         maxval = fmaxf(maxval, x[i]);
     }
-    // now within-warp reductions for maxval
+
+    // Reduce within warp: Each thread has a partial max, combine them
     maxval = warpReduceMax(maxval);
 
-    // the 0th thread of each warp writes the maxval of that warp to shared memory
+    // After warp reduction, lane 0 of each warp has that warp's maximum
     if (laneId == 0) maxvals[warpId] = maxval;
-    __syncthreads();
+    __syncthreads();  // Ensure all warps have written their maxvals
 
-    // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
+    // Reduce across warps: Thread 0 combines all warp maxima
     if (tid == 0) {
-        float val = maxvals[tid];
+        float val = maxvals[0];
         for (int i = 1; i < warpsPerBlock; i++) {
             val = fmaxf(val, maxvals[i]);
         }
-        // store the final max in the first position
-        maxvals[0] = val;
+        maxvals[0] = val;  // Store global maximum
     }
     __syncthreads();
-    // broadcast the max to all threads
+
+    // Broadcast global maximum to all threads
     float offset = maxvals[0];
 
-    // compute expf and write the result to global memory
+    // STEP 2: Compute exp(x - max) and write to output
+    // This is numerically stable: avoids overflow in exp()
     for (int i = tid; i < C; i += blockDim.x) {
-        // subtract max for numerical stability
         out[idx * C + i] = expf(x[i] - offset);
     }
 
-    // okay now we calculated exp(x - max(x))
-    // step 2: sum all the values and divide by the sum
-
-    // thread coarsening for sum
+    // STEP 3: Sum all exp values for normalization
+    // Now read from output (which contains exp values)
     x = out + idx * C;
     float sumval = 0.0f;
     for (int i = tid; i < C; i += blockDim.x) {
         sumval += x[i];
     }
-    // within-warp reduction for sumval
+
+    // Reduce sum within warp
     sumval = warpReduceSum(sumval);
 
-    // write sumval to shared memory
+    // Lane 0 of each warp writes to shared memory
     if (laneId == 0) sumvals[warpId] = sumval;
     __syncthreads();
 
-    // inter-thread reduction of sum
+    // Reduce across warps: Thread 0 computes total sum
     if (tid == 0) {
-        float val = sumvals[tid];
+        float val = sumvals[0];
         for (int i = 1; i < warpsPerBlock; ++i) {
             val += sumvals[i];
         }
         sumvals[0] = val;
     }
     __syncthreads();
-    // broadcast the sum to all threads
+
+    // Broadcast total sum to all threads
     float sum = sumvals[0];
 
-    // divide the whole row by the sum
+    // STEP 4: Normalize by dividing by sum
     for (int i = tid; i < C; i += blockDim.x) {
         out[idx * C + i] = x[i] / sum;
     }
 }
 
 
+/*
+DEVICE HELPER FUNCTIONS: vec_at
+PURPOSE: Access individual float elements within a float4 vector
+WHY NEEDED: float4 is a vectorized type for memory coalescing, but we need element access
+USAGE: vec_at(vec, 0) gets first element, vec_at(vec, 3) gets fourth element
+*/
 __device__ float& vec_at(float4& vec, int index) {
     return reinterpret_cast<float*>(&vec)[index];
 }
@@ -339,42 +556,89 @@ __device__ float vec_at(const float4& vec, int index) {
     return reinterpret_cast<const float*>(&vec)[index];
 }
 
+/*
+KERNEL: softmax_forward_kernel5
+PURPOSE: Highly optimized softmax using online (streaming) algorithm
+APPROACH: Online softmax - updates max and sum incrementally in one pass
+PARALLELIZATION: Warp-level - one warp per row
+KEY INNOVATIONS:
+  1. Online algorithm: Computes softmax in single pass (vs 3 passes in kernel4)
+  2. Fused scaling: Incorporates inv_temperature directly (for attention)
+  3. Autoregressive-aware: Only processes valid positions (lower triangle)
+  4. Vectorized loads: Uses float4 for memory bandwidth efficiency
+ALGORITHM (Online Softmax):
+  Traditional softmax requires:
+    1. max = max(x)
+    2. sum = sum(exp(x - max))
+    3. out = exp(x - max) / sum
+  Online softmax maintains running max and sum:
+    When seeing new value x[i]:
+      if x[i] > maxval:
+        sumval = sumval * exp(old_max - new_max) + exp(x[i] - new_max)
+        maxval = x[i]
+  This allows single-pass computation without storing intermediate values!
+PERFORMANCE CHARACTERISTICS:
+  - Memory efficient: Single pass over data
+  - Compute-bound: More exp() calls but fewer memory accesses
+  - Bandwidth efficient: Vectorized float4 loads
+  - Warp-level parallelism: Natural fit for 32-thread warps
+WHEN TO USE:
+  - When memory bandwidth is the bottleneck
+  - For autoregressive attention (triangular matrices)
+  - When fusing with other operations (like scaling)
+*/
 __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
-    // inp, out shape: (N, T, T), where N = B * NH
-    // fuses the multiplication by scale inside attention
-    // directly autoregressive, so we only compute the lower triangular part
-    // uses the online softmax algorithm
-    assert(T % 4  == 0);
+    // Input/output shape: (N, T, T) where N = B * NH (batch * num_heads)
+    // Each row is a separate softmax operation
+    // inv_temperature = scaling factor (1/sqrt(head_size) for attention)
+    // Only compute lower triangle due to causal masking
+
+    assert(T % 4  == 0);  // Required for float4 vectorization
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // Calculate which row this warp is processing
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     if(idx >= N * T) {
         return;
     }
-    int own_pos = idx % T;
-    int pos_by_4 = own_pos / 4;
 
-    // one row of inp, i.e. inp[idx, :] of shape (T,)
+    int own_pos = idx % T;        // Position within sequence (row index)
+    int pos_by_4 = own_pos / 4;   // Number of float4 vectors to process
+
+    // Pointer to row of input
     const float* x = inp + idx * T;
 
-    // not INF, so we don't get NaNs accidentally when subtracting two values.
+    // Initialize running max and sum for online algorithm
+    // Use -FLT_MAX (not -INF) to avoid NaN when subtracting infinities
     float maxval = -FLT_MAX;
     float sumval = 0.0f;
 
+    // ONLINE SOFTMAX ALGORITHM - Main loop with vectorized loads
+    // Process input in chunks of 4 floats for memory bandwidth efficiency
     const float4* x_vec = reinterpret_cast<const float4*>(x);
     for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
-        float4 v = x_vec[i];
+        float4 v = x_vec[i];  // Load 4 values at once (coalesced access)
+
+        // Update running max and sum for each of the 4 values
         float old_maxval = maxval;
         for(int k = 0; k < 4; ++k) {
             maxval = fmaxf(maxval, vec_at(v, k));
         }
+
+        // Online softmax update: rescale previous sum when max changes
+        // If max increased, previous exp values need to be scaled down
         sumval *= expf(inv_temperature * (old_maxval - maxval));
+
+        // Add contributions from current values
         for(int k = 0; k < 4; ++k) {
             sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
         }
     }
 
+    // Handle remaining elements that don't fit in float4 vectors
+    // Each warp thread processes one element if within bounds
     if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
         float old_maxval = maxval;
         maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
@@ -382,16 +646,24 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
         sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
     }
 
+    // WARP-LEVEL REDUCTIONS
+    // Each thread has computed partial max/sum, now combine across warp
     float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
+
+    // Adjust sum for global max (in case thread's local max wasn't global max)
     sumval *= expf(inv_temperature * (maxval - global_maxval));
 
+    // Combine sums from all threads in warp
     float sum = cg::reduce(warp, sumval, cg::plus<float>{});
-    float norm = 1.f / sum;
+    float norm = 1.f / sum;  // Normalization factor
 
-    // divide the whole row by the sum
+    // WRITE OUTPUT - Compute and store softmax values
+    // Recalculate exp values rather than storing them (saves memory bandwidth)
     for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
-        // recalculation is faster than doing the round-trip through memory.
+        // __ldcs: load with cache streaming hint (won't pollute cache)
+        // Recalculation is faster than storing intermediate values and reading back
         float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
+        // __stcs: store with cache streaming hint
         __stcs(out + idx * T + i, ev * norm);
     }
 }

@@ -1,5 +1,44 @@
 /*
-Mersenne Twisters implementation, numerically identical to torch.
+================================================================================
+File: rand.h
+Purpose: Mersenne Twister random number generator (PyTorch-compatible)
+================================================================================
+
+Overview:
+---------
+This file implements the Mersenne Twister MT19937 random number generator,
+which is numerically identical to PyTorch's RNG. This enables exact reproduction
+of PyTorch training runs when using the same random seed.
+
+Why Mersenne Twister?
+---------------------
+- Industry standard RNG (used by PyTorch, NumPy, etc.)
+- Long period: 2^19937 - 1 (won't repeat for astronomical time)
+- Good statistical properties (passes randomness tests)
+- Fast generation of random numbers
+
+PyTorch Compatibility:
+---------------------
+This implementation produces EXACTLY the same random numbers as PyTorch
+when given the same seed. This is critical for:
+- Reproducing PyTorch experiments in C
+- Verifying correctness against PyTorch
+- Debugging numerical differences
+
+Functionality:
+-------------
+1. Basic RNG: randint32(), randint64(), randfloat32(), randfloat64()
+2. Distributions:
+   - uniform_(): Uniform distribution in [from, to]
+   - normal_(): Normal/Gaussian distribution (mean, std)
+3. Permutations: random_permutation() for shuffling data
+4. Utilities: init_identity_permutation()
+
+Box-Muller Transform:
+--------------------
+Used to convert uniform random numbers to Gaussian (normal) distribution.
+Two uniform numbers -> two independent Gaussian numbers.
+Classic algorithm, widely used and well-tested.
 
 Example usage:
 

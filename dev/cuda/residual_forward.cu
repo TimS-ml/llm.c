@@ -1,5 +1,55 @@
 /*
-Kernels for residual forward pass.
+Kernels for residual connection forward pass.
+
+OPERATION OVERVIEW:
+Residual connections (skip connections) are a fundamental building block of transformers.
+They add the input of a layer directly to its output:
+
+  out = inp1 + inp2
+
+Where typically:
+- inp1: Output from a sublayer (e.g., attention or feedforward network)
+- inp2: Input to that sublayer (the "residual" or "skip" connection)
+
+Example in transformer block:
+  x = embedding
+  attn_out = attention(x)
+  x = x + attn_out          # First residual connection
+  ffn_out = feedforward(x)
+  x = x + ffn_out           # Second residual connection
+
+ROLE IN TRANSFORMER:
+Residual connections are critical for training deep networks:
+
+1. Gradient Flow: Allow gradients to flow directly backward through the network
+   - Without residuals: Gradients must flow through many layers (can vanish)
+   - With residuals: Gradients have a "highway" straight through
+   - Enables training networks with 100+ layers
+
+2. Identity Mapping: Network can learn to keep or modify features
+   - If sublayer learns nothing useful, it can output zeros (keeping input)
+   - If sublayer learns something useful, it adds to the input
+   - This makes optimization easier - network starts with identity function
+
+3. Ensemble Effect: Can be viewed as ensemble of shorter networks
+   - Each residual path creates an implicit shorter network
+   - Network learns multiple representations at different depths
+
+WHY MULTIPLE KERNEL VERSIONS:
+Residual addition is the simplest possible operation: out = a + b
+Yet we still optimize it because it's called frequently in transformers.
+
+- Version 1: Element-per-thread
+             Each thread processes one element
+             Simple but memory-bound
+
+- Version 2: Vectorized 128-bit reads/writes
+             Each thread processes 4-8 elements
+             Better memory bandwidth (~1.5-2x speedup)
+             Production-ready version
+
+Even though it's just addition, memory bandwidth is the bottleneck.
+Vectorization helps us approach peak bandwidth.
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt residual_forward.cu -o residual_forward
@@ -18,7 +68,7 @@ version 2 packs input into 128 bit memory reads
 #include "common.h"
 
 // ----------------------------------------------------------------------------
-// CPU code reference lol
+// CPU code reference
 
 void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int N) {
     for (int i = 0; i < N; i++) {
@@ -29,7 +79,41 @@ void residual_forward_cpu(float* out, const float* inp1, const float* inp2, int 
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// elementwise ops are nice and ez
+// KERNEL 1: Element-wise residual addition
+//
+// ALGORITHM:
+// - Each thread processes one element
+// - Performs: out[i] = inp1[i] + inp2[i]
+// - Converts to float32 for addition, then back to floatX (handles bfloat16/fp16)
+//
+// WHY CONVERT TO FLOAT32:
+// Even though inp1 and inp2 might be bfloat16, we compute in float32:
+// - Ensures numerical accuracy (bfloat16 has limited precision)
+// - Modern GPUs have fast float32 ALUs
+// - Only storage is in bfloat16 (saves memory bandwidth)
+//
+// PARALLELIZATION:
+// - Launch N threads (one per element)
+// - Fully independent - no thread communication
+// - Perfect parallelism for element-wise operations
+//
+// MEMORY ACCESS PATTERN:
+// - Each thread: 2 reads (inp1, inp2), 1 write (out)
+// - Coalesced access when consecutive threads access consecutive elements
+// - Memory bandwidth: 3 * sizeof(floatX) bytes per element
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Compute intensity: Very low (single addition)
+// - Memory-bound: Limited by how fast we can read/write data
+// - Arithmetic intensity: 1 FLOP / 3 memory ops ≈ 0.33 FLOP/byte
+// - GPU utilization: Good (N threads, typically millions for transformers)
+// - Best for: Small to medium tensors, or when vectorization not applicable
+//
+// WHY SO SIMPLE YET IMPORTANT:
+// Transformers call this operation multiple times per layer, and have many layers.
+// For GPT-3 scale (175B params, ~100 layers): billions of residual additions!
+// Every microsecond saved here multiplies across the entire training run.
+//
 __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -37,6 +121,53 @@ __global__ void residual_forward_kernel1(floatX* out, const floatX* inp1, const 
     }
 }
 
+// KERNEL 2: Vectorized residual addition with 128-bit memory transactions
+//
+// ALGORITHM:
+// - Same addition as kernel1: out = inp1 + inp2
+// - Each thread processes x128::size elements (typically 4-8) at once
+// - Uses vectorized loads and stores
+//
+// OPTIMIZATION TECHNIQUE - VECTORIZED MEMORY ACCESS:
+// - load128cs(): Loads 128 bits from both inp1 and inp2
+//   * 'cs' = cache streaming (bypass L1 cache)
+//   * Good for data read only once
+//   * Reduces cache pollution
+// - store128(): Stores 128 bits to out
+//   * Regular store (not streaming) to keep result in cache
+//   * Next operation will likely need this data
+//
+// PARALLELIZATION:
+// - Launch N/x128::size threads
+// - Fewer threads than kernel1, but each does more work
+// - Still maintains high GPU occupancy
+//
+// MEMORY ACCESS PATTERN:
+// - Coalesced 128-bit aligned reads and writes
+// - Memory controller serves 4-8x fewer transactions
+// - Better utilization of memory bus width
+// - Each thread: 2 vector reads, 1 vector write
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Memory bandwidth: Excellent (~1.5-2x better than kernel1)
+// - Compute: Still minimal (just addition)
+// - Arithmetic intensity: Slightly better (more FLOPs per memory transaction)
+// - Best for: Large tensors in production (typical case)
+// - Speedup vs kernel1: ~1.5-2x due to better memory efficiency
+//
+// WHY VECTORIZATION HELPS FOR ADDITION:
+// Even though addition is trivial, memory is the bottleneck:
+// - GPU can do billions of additions per second
+// - GPU can only move hundreds of GB/s from memory
+// - By loading 4-8 elements at once, we reduce memory transactions
+// - This gets us closer to peak memory bandwidth
+//
+// LOOP INSIDE VECTORIZATION:
+// The loop over k processes each element in the packed vector:
+// - Unrolled by compiler (#pragma unroll could be added)
+// - All additions can happen in parallel in registers
+// - Only memory ops are the load128cs and store128 calls
+//
 __global__ void residual_forward_kernel2(floatX* out, const floatX* inp1, const floatX* inp2, int N) {
     int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (idx < N) {

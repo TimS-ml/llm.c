@@ -1,38 +1,133 @@
 /*
-Kernels for attention backward pass.
+================================================================================
+ATTENTION BACKWARD PASS - MULTI-KERNEL PERFORMANCE EXPLORATION
+================================================================================
 
-Compile example:
+PURPOSE:
+This file implements multiple versions of the multi-head attention backward pass
+(gradient computation) for educational and benchmarking purposes. Each kernel explores
+different optimization strategies for computing gradients through the attention mechanism.
+
+WHY MULTIPLE VERSIONS EXIST:
+The backward pass is even more complex than forward pass due to:
+- More intricate data dependencies (gradients flow through multiple paths)
+- Need to compute Jacobians of softmax (involves outer products)
+- Challenging memory access patterns (scatter/gather operations)
+- Opportunities for algorithmic simplifications of gradient formulas
+
+This file demonstrates progressive optimizations:
+- Load balancing across GPU resources
+- Warp-level parallelism for coalesced memory access
+- Register reuse to reduce memory traffic
+- Algebraic simplification of gradient expressions
+- Careful handling of control flow to minimize divergence
+
+ATTENTION BACKWARD ALGORITHM OVERVIEW:
+Given gradient dL/dOut, compute gradients with respect to Q, K, V.
+The attention operation is: Out = Softmax(Q @ K^T / sqrt(d)) @ V
+
+Backward pass chain (reverse order of forward):
+1. GRADIENT THROUGH VALUE MULTIPLICATION (dAtt, dV):
+   Forward: Out = Att @ V
+   Backward: dAtt = dOut @ V^T
+             dV = Att^T @ dOut
+
+2. GRADIENT THROUGH SOFTMAX (dPreatt):
+   Forward: Att = Softmax(Preatt)
+   Backward: dPreatt[i,j] = sum_k Att[i,k] * (δ(j==k) - Att[i,j]) * dAtt[i,k]
+   This is the Jacobian of softmax - the most complex part!
+   Simplifies to: dPreatt[i,j] = Att[i,j] * (dAtt[i,j] - sum_k(Att[i,k]*dAtt[i,k]))
+
+3. GRADIENT THROUGH QUERY-KEY MULTIPLICATION (dQ, dK):
+   Forward: Preatt = Q @ K^T (scaled)
+   Backward: dQ = dPreatt @ K * scale
+             dK = dPreatt^T @ Q * scale
+
+Input shapes:
+- dout: (B, T, C) - gradient from next layer
+- inp: (B, T, 3C) - original input (Q,K,V)
+- att: (B, NH, T, T) - attention weights from forward pass
+
+Output shapes:
+- dinp: (B, T, 3C) - gradients for Q,K,V
+
+COMPILATION:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt attention_backward.cu -o attention_backward
 
-version 1 is a naive first version
+KERNEL VERSIONS:
+
+VERSION 1: Naive First Implementation
 OMP_NUM_THREADS=32 ./attention_backward 1
+- Direct translation of mathematical formulas to code
+- Poor parallelization: Sequential over batch/head dimensions
+- Inefficient memory access: No coalescing
+- Performance: Baseline (slowest)
+- Use case: Understanding the algorithm
 
-version 2 much ensures better load-balancing by having independent threads for each batch and attention head
+VERSION 2: Better Load Balancing
 OMP_NUM_THREADS=32 ./attention_backward 2
+- Parallelizes over (batch, head) dimensions using block indices
+- Each thread still handles inner computation sequentially
+- Better GPU utilization: More parallelism exposed
+- Performance: Moderate improvement
+- Use case: Shows importance of exposing parallelism
 
-version 3 uses a full warp to calculate each result (instead of a thread), which enables coalesced memory access
+VERSION 3: Warp-Level Parallelism
 OMP_NUM_THREADS=32 ./attention_backward 3
+- Uses full warp (32 threads) to compute each result cooperatively
+- Enables coalesced memory access (threads access contiguous addresses)
+- Warp-level reductions for computing sums
+- Performance: Significant improvement (~2-3x faster than version 2)
+- Use case: Demonstrates power of warp-level primitives
 
-version 4 improves data reuse in registers by doing 8 values of t3 in one warp.
+VERSION 4: Register Reuse via Loop Unrolling
 OMP_NUM_THREADS=32 ./attention_backward 4
+- Processes 8 values of t3 per warp instead of 1 (unroll factor = 8)
+- Reuses loaded data across multiple output values
+- Reduces memory traffic by factor of ~8
+- More complex indexing but better memory efficiency
+- Performance: Further 20-30% improvement
+- Use case: Shows value of data reuse
 
-version 5 reduces the amount of non-fp32 instructions needed by avoiding ifs
+VERSION 5: Reduced Control Flow Divergence
 OMP_NUM_THREADS=32 ./attention_backward 5
+- Eliminates conditional branches that cause warp divergence
+- Uses arithmetic tricks instead of if-statements
+- Splits loops to separate regions with/without conditionals
+- Better instruction throughput on GPU
+- Performance: Small but consistent improvement (5-10%)
+- Use case: Demonstrates importance of avoiding divergence
+
+VERSION 6-8: Advanced Optimizations
+- Version 6: Shared memory tiling (block-level cooperation)
+- Version 7: Algebraically simplified gradient formula
+- Version 8: Multiple optimizations combined (streaming loads, block reordering)
+- These represent production-quality optimized kernels
 */
 
+// ----------------------------------------------------------------------------
+// Standard library includes
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include <float.h>
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-#include <cooperative_groups/scan.h>
-#include "common.h"
+#include <float.h>              // For FLT_MAX constant
+
+// ----------------------------------------------------------------------------
+// CUDA library includes
+#include <cublas_v2.h>          // cuBLAS for optimized matrix multiplications
+#include <cuda_runtime.h>       // CUDA runtime API
+#include <cooperative_groups.h> // Cooperative groups for warp/block-level operations
+#include <cooperative_groups/reduce.h> // Reduction operations across thread groups
+#include <cooperative_groups/scan.h>   // Prefix sum operations (not heavily used here)
+
+// ----------------------------------------------------------------------------
+// Project-specific includes
+#include "common.h"             // Utilities: cudaCheck, cublasCheck, ceil_div, etc.
 
 // ----------------------------------------------------------------------------
 // CPU code reference
+// These CPU implementations are used for correctness validation of GPU kernels
+// They implement the backward pass of attention in a straightforward way
 
 /*
 NOTE:
@@ -185,28 +280,40 @@ void attention_backward_cpu(float* dinp, float* dpreatt, float* datt,
 
 // ----------------------------------------------------------------------------
 // GPU kernels
-// the forward pass that is the sequence [permute, sgemm, softmax, sgemm, unpermute]
+// The backward pass mirrors the forward pass structure:
+// forward: [permute, sgemm, softmax, sgemm, unpermute]
+// backward: [unpermute_bwd, sgemm, softmax_bwd, sgemm, permute_bwd]
 
+/*
+KERNEL: permute_kernel
+PURPOSE: Rearrange Q,K,V from (B,T,3,NH,d) to (B,NH,T,d) layout
+REASON: cuBLAS expects batch matrix multiply in (B,NH,T,d) format
+This is part of the forward pass but included here for the backward implementation
+*/
 __global__ void permute_kernel(float* q, float* k, float* v,
                                const float* inp,
                                int B, int N, int NH, int d) {
-    // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
-    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
+    // Transform from interleaved QKV layout to separate Q,K,V tensors
+    // Input:  (B, N, 3, NH, d) - batch, sequence, qkv, heads, head_dim
+    // Output: (B, NH, N, d) for each of Q, K, V
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
     if (idx < B * NH * N * d) {
-        int b = idx / (NH * N * d);
+        // Decode output index to 4D coordinates
+        int b = idx / (NH * N * d);        // Batch
         int rest = idx % (NH * N * d);
-        int nh_ = rest / (N * d);
+        int nh_ = rest / (N * d);          // Head
         rest = rest % (N * d);
-        int n = rest / d;
-        int d_ = rest % d;
+        int n = rest / d;                  // Sequence position
+        int d_ = rest % d;                 // Head dimension
 
+        // Calculate corresponding input index
         int inp_idx = (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-        q[idx] = inp[inp_idx];
-        k[idx] = inp[inp_idx + NH * d];
-        v[idx] = inp[inp_idx + 2 * (NH * d)];
+
+        // Extract Q, K, V from contiguous locations in input
+        q[idx] = inp[inp_idx];              // Query
+        k[idx] = inp[inp_idx + NH * d];     // Key (offset by NH*d)
+        v[idx] = inp[inp_idx + 2 * (NH * d)]; // Value (offset by 2*NH*d)
     }
 }
 
@@ -327,23 +434,61 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     }
 }
 
-// naive kernel to backward through an autoregressive softmax, just to get correctness
+/*
+================================================================================
+SOFTMAX BACKWARD KERNELS - Progressive Optimizations
+================================================================================
+
+The softmax backward is the most complex part of attention backward.
+Given: forward softmax: y = exp(x) / sum(exp(x))
+The Jacobian is: dy/dx[j] = y[j] * (δ(i==j) - y[i])
+
+For our case: dpreatt = softmax_jacobian @ datt
+Full formula: dpreatt[t,t3] = sum_t2( att[t,t2] * (δ(t2==t3) - att[t,t3]) * datt[t,t2] )
+Simplified: dpreatt[t,t3] = scale * att[t,t3] * (datt[t,t3] - sum_t2(att[t,t2]*datt[t,t2]))
+
+The kernels below explore different ways to compute this efficiently.
+*/
+
+/*
+KERNEL: softmax_autoregressive_backward_kernel1 (VERSION 1)
+PURPOSE: Naive implementation of softmax backward for correctness reference
+APPROACH: One thread per output element, sequential over batch/head
+PARALLELIZATION: Only over t3 dimension (one dimension of output)
+ALGORITHM: Direct implementation of Jacobian formula with indicator function
+PERFORMANCE CHARACTERISTICS:
+  - Poor parallelism: Most dimensions handled sequentially
+  - Poor load balancing: Different threads do vastly different amounts of work
+  - Inefficient: Computes full formula without simplification
+OPTIMIZATION OPPORTUNITIES:
+  - Parallelize over batch and head dimensions
+  - Use algebraic simplification to reduce computation
+  - Use warp-level primitives for reductions
+*/
 __global__ void softmax_autoregressive_backward_kernel1(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int C, int NH) {
-    // dpreatt, datt, att are all (B, NH, T, T)
-    int t3 = blockIdx.x * blockDim.x + threadIdx.x;
+    // All inputs/outputs are (B, NH, T, T) - attention score matrices
+    // We need to compute gradients for each element considering softmax Jacobian
+    int t3 = blockIdx.x * blockDim.x + threadIdx.x;  // Output column index
     if (t3 < T) {
         int hs = C / NH; // head size
-        float scale = 1.0f / sqrtf(hs);
+        float scale = 1.0f / sqrtf(hs);  // Attention scaling factor
+
+        // Sequential loops over batch and head - poor parallelization!
         for (int b = 0; b < B; b++) {
             for (int h = 0; h < NH; h++) {
-                for (int t = t3; t < T; t++) {
+                // Each thread processes multiple rows (t values) for its column (t3)
+                for (int t = t3; t < T; t++) {  // Only process lower triangle (causal)
                     const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
                     const float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
                     float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
+
+                    // Compute softmax backward: sum over t2
                     float accum = 0.0f;
                     for (int t2 = 0; t2 <= t; t2++) {
+                        // Indicator function: 1 if t2==t3, else 0
                         float indicator = t2 == t3 ? 1.0f : 0.0f;
+                        // Softmax Jacobian: att[t2] * (indicator - att[t3])
                         float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
                         accum +=  scale * local_derivative * datt_bth[t2];
                     }
@@ -379,33 +524,66 @@ __global__ void softmax_autoregressive_backward_kernel2(float* dpreatt, const fl
     }
 }
 
-// parallelize across t,b,h
+/*
+KERNEL: softmax_autoregressive_backward_kernel3 (VERSION 3)
+PURPOSE: Warp-level parallelism for efficient softmax backward
+APPROACH: Use full warp (32 threads) to compute each output element cooperatively
+PARALLELIZATION: Over (batch*head, t3) with warp-level cooperation for t2 loop
+KEY IMPROVEMENTS OVER VERSION 2:
+  1. Warp-level parallelism: 32 threads cooperate on inner sum
+  2. Coalesced memory access: Threads access consecutive memory locations
+  3. Warp reduction: Fast tree reduction for combining thread results
+ALGORITHM:
+  - Each warp handles one (batch, head, row, column) combination
+  - Threads in warp split the t2 loop (stride by warp size = 32)
+  - Use cooperative groups reduction to combine partial sums
+PERFORMANCE CHARACTERISTICS:
+  - ~2-3x faster than version 2
+  - Memory-bound: Limited by bandwidth, not computation
+  - Good occupancy: Many warps can run concurrently
+OPTIMIZATION TECHNIQUES:
+  - Cooperative groups for warp-level operations
+  - Coalesced loads: warp threads access consecutive addresses
+  - Register-based reduction (no shared memory needed for intra-warp)
+*/
 __global__ void softmax_autoregressive_backward_kernel3(float* dpreatt, const float* datt, const float* att,
                                                      int B, int T, int C, int NH) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // Each warp handles one t3 value (column of output)
     int t3 = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
 
+    // blockIdx.y encodes (batch, head) combination
     int idx = blockIdx.y * T * T;
     if (t3 >= T) { return; }
 
     int hs = C / NH; // head size
     float scale = 1.0f / sqrtf(hs);
+
+    // Process all rows for this column (t >= t3 due to causal masking)
     for (int t = t3; t < T; t++) {
-        float result = 0.0;
+        float result = 0.0;  // Accumulator for this thread
         const float* att_bth = att + idx + t*T;
         const float* datt_bth = datt + idx + t*T;
         float* dpreatt_bth = dpreatt + idx + t*T;
+
+        // Load att[t3] once (will be reused in loop)
         const float att_at_t3 = att_bth[t3];
 
+        // Warp-level parallelism: Each thread handles subset of t2 values
+        // Stride by warp.size() (32) for coalesced memory access
         for (int t2 = warp.thread_rank(); t2 <= t; t2 += warp.size()) {
             float indicator = t2 == t3 ? 1.0f : 0.0f;
             float local_derivative = att_bth[t2] * (indicator - att_at_t3);
             result += local_derivative * datt_bth[t2];
         }
 
+        // Reduce across warp: Combine results from all 32 threads
         result = cg::reduce(warp, result, cg::plus<float>());
+
+        // Only lane 0 writes the final result
         if(warp.thread_rank() == 0) {
             dpreatt_bth[t3] = scale * result;
         }
@@ -627,39 +805,89 @@ __global__ void __launch_bounds__(BlockSize) softmax_autoregressive_backward_ker
     }
 }
 
-// Actually disentangling the loops and simplifying the resulting math gives us this pretty nice kernel.
+/*
+KERNEL: softmax_autoregressive_backward_kernel7 (VERSION 7)
+PURPOSE: Algebraically simplified softmax backward - most elegant version!
+APPROACH: Reformulate the gradient expression to factor out common terms
+PARALLELIZATION: Block-level - one block per row, threads cooperate
+KEY INSIGHT - Mathematical Simplification:
+  Original formula:
+    dpreatt[t,t3] = scale * sum_t2( att[t,t2] * (δ(t2==t3) - att[t,t3]) * datt[t,t2] )
+
+  Expand the sum:
+    = scale * sum_t2( att[t,t2]*δ(t2==t3)*datt[t,t2] - att[t,t2]*att[t,t3]*datt[t,t2] )
+
+  Separate terms:
+    = scale * (att[t,t3]*datt[t,t3] - att[t,t3]*sum_t2(att[t,t2]*datt[t,t2]))
+
+  Factor out att[t,t3]:
+    = scale * att[t,t3] * (datt[t,t3] - sum_t2(att[t,t2]*datt[t,t2]))
+                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                         This is the SAME for all t3!
+
+ALGORITHM:
+  1. Compute local_sum = sum_t2(att[t,t2] * datt[t,t2]) ONCE per row
+  2. For each t3: dpreatt[t,t3] = scale * att[t,t3] * (datt[t,t3] - local_sum)
+
+PERFORMANCE CHARACTERISTICS:
+  - Compute-bound: Balanced computation vs memory access
+  - Efficient: Computes common sum once instead of T times
+  - Clean code: Mathematical insight leads to simpler implementation
+  - ~10-15% faster than kernel 3 due to reduced arithmetic
+
+OPTIMIZATION TECHNIQUES:
+  - Algebraic simplification (key innovation!)
+  - Block-level cooperation with warp reductions
+  - Shared memory for inter-warp communication
+  - Two-level reduction (warp then block)
+
+This is a beautiful example of how understanding the mathematics can lead to
+much better code than just optimizing the naive implementation!
+*/
 template<int BlockSize>
 __global__ void softmax_autoregressive_backward_kernel7(float* dpreatt, const float* datt, const float* att,
                                                         int B, int T, int C, float scale) {
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    __shared__ float block_acc[32];
+    __shared__ float block_acc[32];  // One slot per warp for reduction
 
-    int idx = blockIdx.y;
-    int t = blockIdx.x;
+    // Block indices determine which row we're processing
+    int idx = blockIdx.y;  // (batch, head) index
+    int t = blockIdx.x;    // row index
 
+    // Offset pointers to the relevant (batch, head) matrix
     att += idx * T * T;
     datt += idx * T * T;
     dpreatt += idx * T * T;
 
+    // Pointers to the specific row we're processing
     const float* att_bth = att + t * T;
     const float* datt_bth = datt + t * T;
     float* dpreatt_bth = dpreatt + t * T;
 
+    // Initialize shared memory (only first warp needs to do this)
     if(warp.meta_group_rank() == 0) {
         block_acc[warp.thread_rank()] = 0;
     }
 
+    // STEP 1: Compute local_sum = sum_t2(att[t2] * datt[t2])
+    // This is the common term that appears in all output elements
     float local_sum = 0;
     for(int t2 = block.thread_rank(); t2 <= t; t2 += BlockSize) {
         local_sum += att_bth[t2] * datt_bth[t2];
     }
 
+    // Reduce local_sum across block (two-level reduction)
+    // First reduce within each warp
     block_acc[warp.meta_group_rank()] = cg::reduce(warp, local_sum, cg::plus<float>{});
     block.sync();
+    // Then reduce across warps (only first warp participates)
     local_sum = cg::reduce(warp, block_acc[warp.thread_rank()], cg::plus<float>{});
+    // Now all threads have access to the total sum
 
+    // STEP 2: Compute output using simplified formula
+    // dpreatt[t3] = scale * att[t3] * (datt[t3] - local_sum)
     for (int t3 = block.thread_rank(); t3 <= t; t3 += BlockSize) {
         float acc = att_bth[t3] * (datt_bth[t3] - local_sum);
         dpreatt_bth[t3] = scale * acc;

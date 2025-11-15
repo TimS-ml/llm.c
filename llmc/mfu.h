@@ -1,3 +1,67 @@
+/*
+================================================================================
+File: mfu.h
+Purpose: Model FLOPs Utilization (MFU) calculation and GPU monitoring
+================================================================================
+
+Overview:
+---------
+This file provides utilities to measure how efficiently we're using the GPU's
+computational capacity during training. MFU is a key performance metric that
+tells us if we're GPU-bound or have optimization opportunities.
+
+What is MFU?
+-----------
+MFU (Model FLOPs Utilization) = Actual FLOPs / Theoretical Peak FLOPs
+
+- Actual FLOPs: FLOPs performed by our training code
+- Theoretical Peak: Maximum FLOPs the GPU can achieve (from spec sheet)
+- MFU of 50-60% is typical for well-optimized LLM training
+- MFU < 30% suggests optimization opportunities
+
+Why MFU Matters:
+---------------
+- Shows if we're GPU-bound (high MFU) or CPU/memory-bound (low MFU)
+- Helps diagnose performance bottlenecks
+- Enables fair comparison across different GPUs
+- Industry standard metric for reporting training efficiency
+
+GPU Database:
+------------
+Contains theoretical peak FLOPS for common NVIDIA GPUs:
+- Volta (V100)
+- Ampere (A100, RTX 30xx, RTX Axx)
+- Hopper (H100)
+- Ada (RTX 40xx, RTX Axx Ada)
+
+For each GPU, we store:
+- Tensor core performance at different precisions
+- Number of tensor cores
+- Clock frequency
+- Allows computing theoretical peak for any supported GPU
+
+NVML Integration:
+----------------
+NVML (NVIDIA Management Library) provides runtime GPU monitoring:
+- Clock speeds
+- Power usage
+- Temperature
+- Utilization percentages
+- Throttling status
+
+This helps diagnose performance issues (thermal throttling, power limiting, etc.)
+
+Usage:
+------
+    // Get theoretical peak for this GPU
+    float peak_flops = get_flops_promised("NVIDIA A100-SXM4-80GB", PRECISION_BF16);
+
+    // Monitor GPU state
+    GPUUtilInfo info = get_gpu_utilization_info();
+    printf("GPU: %u%%, Mem: %u%%, Throttle: %s\\n",
+           info.gpu_utilization, info.mem_utilization, info.throttle_reason);
+*/
+
 #ifndef MFU_H
 #define MFU_H
 
@@ -11,7 +75,7 @@
 #define USE_NVML 0
 #endif
 
-// tied to enum PrecisionMode, in a future refactor make them the same
+// Precision mode constants (tied to enum PrecisionMode in cuda_common.h)
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2

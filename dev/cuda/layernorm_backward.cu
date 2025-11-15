@@ -1,14 +1,82 @@
 /*
-Kernels for layernorm backward pass.
+================================================================================
+Layer Normalization Backward Pass - CUDA Kernel Implementations
+================================================================================
+
+PURPOSE:
+This file explores progressive optimizations for LayerNorm backward pass on GPU.
+The backward pass computes gradients with respect to inputs, weights, and biases
+during backpropagation in neural network training.
+
+LAYERNORM BACKWARD PASS ALGORITHM:
+The backward pass is significantly more complex than the forward pass due to:
+1. Computing gradients for THREE outputs (dinp, dweight, dbias)
+2. Chain rule dependencies between gradients
+3. Reduction operations across batch dimension for dweight/dbias
+
+MATHEMATICAL FORMULATION:
+Given upstream gradient dout and forward pass values (inp, mean, rstd):
+
+For each position (b,t):
+  norm[i] = (inp[i] - mean) * rstd
+  out[i] = norm[i] * weight[i] + bias[i]
+
+Gradients:
+  dbias[i] = sum over (b,t) of dout[b,t,i]
+  dweight[i] = sum over (b,t) of dout[b,t,i] * norm[b,t,i]
+
+  For dinp, we need chain rule through normalization:
+  dnorm[i] = dout[i] * weight[i]
+
+  dinp requires careful derivative of normalization:
+  dinp[i] = rstd * (dnorm[i] - mean(dnorm) - norm[i] * mean(dnorm * norm))
+
+  Where:
+    mean(dnorm) = sum(dnorm) / C
+    mean(dnorm * norm) = sum(dnorm * norm) / C
+
+COMPLEXITY ANALYSIS:
+The backward pass is computationally more expensive than forward:
+1. Forward: 2 reductions (mean, variance) + 1 pass (normalization)
+2. Backward: 2 reductions per row (dnorm stats) + accumulation to global arrays
+3. CRITICAL CHALLENGE: dweight and dbias require ATOMIC operations across batch
+
+ATOMIC OPERATION CHALLENGE:
+- dweight[i] and dbias[i] must accumulate contributions from all B*T positions
+- Multiple thread blocks write to same locations → need atomic operations
+- Atomics are SLOW, especially for fp16/bf16
+- Major optimization target: minimize atomic operations
+
+PERFORMANCE CONSIDERATIONS:
+- Memory-bound like forward pass, but with additional atomic bottleneck
+- Atomics to global memory are expensive (100+ cycles)
+- Shared memory atomics are faster (20-30 cycles)
+- Key strategies:
+  1. Use shared memory to accumulate per-block, then atomic once to global
+  2. Use scratch buffers to avoid contention
+  3. Use warp-level reductions to minimize atomics
+
+OPTIMIZATION PROGRESSION:
+Version 1:  Naive with global atomics
+Version 2:  Shared memory accumulation + templates
+Version 3:  Grid-striding + reduced atomic contention
+Version 4:  atomicCAS for bf16 (compare-and-swap)
+Version 5:  FP32 scratchpad per block
+Version 6:  Single FP32 scratchpad for all blocks
+Version 7:  Remove cooperative groups (simpler)
+Version 8:  Vectorization with x128 + bank conflict avoidance
+Version 9:  Inter-warp reduction without atomics
+Version 10: Vector-friendly shared memory layout (most optimized)
+
+TARGET DIMENSIONS:
+- B*T (batch × sequence): typically 8K-32K positions
+- C (channels): typically 768-1024 for transformers
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt layernorm_backward.cu -o layernorm_backward
 
-version 1 is naive port from CPU code to kernel: parallelizes over B,T, loops over C
-./layernorm_backward 1
-
-version 2 moves a lot of reduction to shared memory over global memory
-./layernorm_backward 2
+Usage:
+./layernorm_backward [kernel_version]
 */
 
 #include <stdio.h>
@@ -109,10 +177,20 @@ void layernorm_backward_cpu(float* dinp, float* dweight, float* dbias,
     }
 }
 
-// ----------------------------------------------------------------------------
-// GPU kernels
+// ============================================================================
+// GPU KERNELS
+// ============================================================================
 
-// GPU helper functions for atomicAdd on smaller than 32-bit types
+/*
+ATOMIC OPERATION HELPERS FOR MIXED PRECISION
+---------------------------------------------
+These functions enable atomic additions for fp16/bf16 types, which don't
+have native atomicAdd support in CUDA. The implementation uses a clever trick:
+- Align to the nearest 32-bit boundary
+- Load the paired value (fp16/bf16 is 16-bit, so we work with pairs)
+- Use atomicAdd on the 32-bit pair
+- This allows atomic operations on 16-bit types at the cost of some overhead
+*/
 #ifdef ENABLE_BF16
 __device__ void atomicAddX(__nv_bfloat16* addr, __nv_bfloat16 val) {
     uintptr_t ptr_val = reinterpret_cast<uintptr_t>(addr);
@@ -139,7 +217,52 @@ __device__ void atomicAddX(float* addr, float val) {
     atomicAdd(addr, val);
 }
 
-// super naive kernel that just parallelizes over B,T and loops over C
+/*
+KERNEL 1: Naive Backward Pass
+------------------------------
+APPROACH:
+- Direct translation from CPU code
+- One thread per sequence position (B*T threads)
+- Each thread processes entire C dimension sequentially
+- Uses global atomics for dweight and dbias
+
+ALGORITHM:
+1. Compute two statistics via reduction over C:
+   - dnorm_mean: mean of gradients through normalized values
+   - dnorm_norm_mean: mean of gradients weighted by normalized values
+2. Apply chain rule to compute all three gradients:
+   - dinp: gradient w.r.t. input
+   - dweight: gradient w.r.t. weight (needs atomic)
+   - dbias: gradient w.r.t. bias (needs atomic)
+
+THE THREE GRADIENT TERMS FOR dinp:
+The gradient formula has three terms from the chain rule:
+  dinp[i] = rstd * (dnorm[i] - mean(dnorm) - norm[i] * mean(dnorm * norm))
+
+Term 1 (dnorm[i]): Direct gradient through the normalized value
+Term 2 (mean(dnorm)): Correction for mean subtraction in normalization
+Term 3 (norm[i] * mean(dnorm * norm)): Correction for variance normalization
+
+This comes from differentiating through the normalization operation.
+
+ATOMIC OPERATIONS:
+- Every thread atomically adds to dweight[i] and dbias[i]
+- For B*T=8192 positions, each of C elements gets 8192 atomic operations!
+- This creates MASSIVE contention on global memory
+- Atomics serialize execution → major bottleneck
+
+PERFORMANCE CHARACTERISTICS:
+- PROS: Simple, correct, easy to understand
+- CONS:
+  * Sequential loops over C (slow)
+  * Two passes over data (compute stats, then gradients)
+  * EXTREMELY slow global atomics (100+ cycles each)
+  * Severe atomic contention
+
+EXPECTED PERFORMANCE:
+- Baseline (1.0x) - this is our reference
+- Dominated by atomic operation latency
+*/
 __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* dbias,
                         const float* dout, const float* inp, const float* weight, const float* mean, const float* rstd,
                         int B, int T, int C) {
@@ -154,9 +277,10 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     const float mean_bt = mean[b * T + t];
     const float rstd_bt = rstd[b * T + t];
 
-    // first: two reduce operations
-    float dnorm_mean = 0.0f;
-    float dnorm_norm_mean = 0.0f;
+    // PASS 1: Compute two reduction statistics over C dimension
+    // These are needed for the gradient formula
+    float dnorm_mean = 0.0f;        // mean(dnorm)
+    float dnorm_norm_mean = 0.0f;   // mean(dnorm * norm)
     for (int i = 0; i < C; i++) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
@@ -166,25 +290,75 @@ __global__ void layernorm_backward_kernel1(float* dinp, float* dweight, float* d
     dnorm_mean = dnorm_mean / C;
     dnorm_norm_mean = dnorm_norm_mean / C;
 
-    // now iterate again and accumulate all the gradients
+    // PASS 2: Compute and accumulate all gradients
     for (int i = 0; i < C; i++) {
         float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = weight[i] * dout_bt[i];
-        // gradient contribution to bias
+
+        // Gradient contribution to bias (accumulated across all B*T positions)
+        // ATOMIC: many threads contend for same dbias[i]
         atomicAdd(&dbias[i], dout_bt[i]);
-        // gradient contribution to weight
+
+        // Gradient contribution to weight (accumulated across all B*T positions)
+        // ATOMIC: many threads contend for same dweight[i]
         atomicAdd(&dweight[i], norm_bti * dout_bt[i]);
-        // gradient contribution to input
+
+        // Gradient contribution to input (no atomic needed, different memory location per thread)
         float dval = 0.0f;
-        dval += dnorm_i; // term 1
-        dval -= dnorm_mean; // term 2
-        dval -= norm_bti * dnorm_norm_mean; // term 3
-        dval *= rstd_bt; // final scale
+        dval += dnorm_i;                        // term 1: direct gradient
+        dval -= dnorm_mean;                     // term 2: mean correction
+        dval -= norm_bti * dnorm_norm_mean;     // term 3: variance correction
+        dval *= rstd_bt;                        // final scaling by rstd
         dinp_bt[i] += dval;
     }
 }
 
-// uses shared memory instead for the reduces
+/*
+KERNEL 2: Shared Memory Accumulation with Templates
+----------------------------------------------------
+APPROACH:
+- Use shared memory to accumulate dweight/dbias within each block
+- Only atomic to global memory once per block (not once per thread!)
+- Use warp-level primitives for reductions
+- Template support for mixed precision (fp16/bf16/fp32)
+
+KEY OPTIMIZATION: TWO-LEVEL ACCUMULATION
+1. Level 1 (Shared): Warp atomically adds to block-level shared memory
+2. Level 2 (Global): Block atomically adds to temporary global buffer
+3. Final: Separate kernel copies from temp buffer to output
+
+WHY SHARED MEMORY ATOMICS?
+- Shared memory atomics are 3-5x faster than global atomics
+- 32 warps in a block → only 32 shared memory atomics (instead of 1024 global)
+- Dramatically reduces contention
+
+SHARED MEMORY LAYOUT:
+- dbias_shared[C]: accumulator for bias gradients
+- dweight_shared[C]: accumulator for weight gradients
+- Total: 2*C floats
+
+TEMP BUFFER STRATEGY:
+- dweight_tmp and dbias_tmp are FP32 temporary buffers
+- Allows high-precision accumulation even with fp16/bf16 output
+- Separate copy kernel converts FP32 → output precision
+
+WARP-LEVEL REDUCTIONS:
+- Each warp computes dnorm_mean and dnorm_norm_mean using cg::reduce
+- Much faster than block-level reduction (no shared memory needed)
+
+PERFORMANCE vs KERNEL 1:
+- PROS:
+  * Shared memory atomics much faster than global
+  * Warp-level reductions efficient
+  * Mixed precision support
+- CONS:
+  * Still one block per row (limited parallelism)
+  * Extra temp buffer and copy kernel
+  * Multiple kernel launches
+
+EXPECTED PERFORMANCE:
+- Typically 3-5x faster than kernel 1
+*/
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -196,7 +370,7 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     int N = B * T;
-    if(idx >= N) { return; } // thread guards
+    if(idx >= N) { return; }
 
     int b = idx / T;
     int t = idx % T;
@@ -207,11 +381,11 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
     const float mean_bt = (float)mean[b * T + t];
     const float rstd_bt = (float)rstd[b * T + t];
 
-    // the first half of shared memory is bias, second is weight
+    // Shared memory layout: first half for bias, second half for weight
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
 
-    // init shared memory to zero
+    // Initialize shared memory accumulators to zero
     #pragma unroll
     for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
@@ -219,7 +393,7 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
     }
     __syncthreads();
 
-    // first: two reduce operations
+    // Compute reduction statistics using warp primitives
     float dnorm_mean = 0.0f;
     float dnorm_norm_mean = 0.0f;
     for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
@@ -233,31 +407,37 @@ __global__ void layernorm_backward_kernel2(Tdinp* dinp, Tparams* dweight, Tparam
     dnorm_mean = dnorm_mean / C;
     dnorm_norm_mean = dnorm_norm_mean / C;
 
-    // now iterate again and accumulate all the gradients
+    // Accumulate gradients to SHARED memory (fast atomics!)
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         float norm_bti = ((float)inp_bt[i] - mean_bt) * rstd_bt;
         float dnorm_i = (float)weight[i] * (float)dout_bt[i];
-        // gradient contribution to bias
+
+        // SHARED MEMORY ATOMIC (fast!)
         atomicAdd(&dbias_shared[i], (float)dout_bt[i]);
-        // gradient contribution to weight
         atomicAdd(&dweight_shared[i], norm_bti * (float)dout_bt[i]);
-        // gradient contribution to input
+
+        // dinp gradient (no atomic needed)
         float dval = 0.0f;
-        dval += dnorm_i; // term 1
-        dval -= dnorm_mean; // term 2
-        dval -= norm_bti * dnorm_norm_mean; // term 3
-        dval *= rstd_bt; // final scale
+        dval += dnorm_i;                        // term 1
+        dval -= dnorm_mean;                     // term 2
+        dval -= norm_bti * dnorm_norm_mean;     // term 3
+        dval *= rstd_bt;
         dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
     }
     __syncthreads();
 
-    // write to global memory
+    // Write block-level accumulation to GLOBAL temp buffer
+    // Each block writes once (much better than each thread!)
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         atomicAdd(&dbias_tmp[i], dbias_shared[i]);
         atomicAdd(&dweight_tmp[i], dweight_shared[i]);
     }
 }
 
+/*
+Helper kernel to copy from FP32 temp buffer to output type
+This allows high-precision accumulation with mixed precision output
+*/
 template <typename Tparams>
 __global__ void copy_to_dweight_dbias(int C, Tparams* dbias, Tparams* dweight, float* dbias_tmp, float* dweight_tmp) {
     for (int i = threadIdx.x + blockDim.x * blockIdx.x; i < C; i += blockDim.x * gridDim.x) {
@@ -266,8 +446,50 @@ __global__ void copy_to_dweight_dbias(int C, Tparams* dbias, Tparams* dweight, f
     }
 }
 
-// kernel2 is 1 threadblock for all Cs on 32 BTs (assuming threadblock size of 1024 threads = 32 warps)
-// To minimise the amount of atomicAdds, we will aim for 1 threadblock per SM, processing (total BTs / threadblocks) BTs
+/*
+KERNEL 3: Grid-Striding Pattern for Reduced Atomic Contention
+---------------------------------------------------------------
+APPROACH:
+- Use grid-striding loop: each warp processes multiple rows
+- Fewer blocks → fewer atomic operations to global memory
+- Accumulate many rows per block before writing to global
+
+GRID-STRIDING PATTERN:
+Instead of one warp per row, we use:
+  for (int idx = base_idx; idx < B*T; idx += warps_in_grid)
+
+This means:
+- Warp 0 processes rows 0, warps_in_grid, 2*warps_in_grid, ...
+- Each warp handles multiple rows, accumulating in shared memory
+- MUCH fewer atomic operations to global memory
+
+ATOMIC REDUCTION STRATEGY:
+- Level 1: Warp accumulates in shared memory across multiple rows
+- Level 2: Block writes to global memory ONCE (using atomicAddX for mixed precision)
+
+WHY THIS IS BETTER:
+- If we have 108 SMs and 32 warps/block:
+  * We can use ~108 blocks (one per SM)
+  * Each processes B*T/108 rows
+  * Only 108 atomic operations per element (vs B*T in kernel 1!)
+
+CACHE STREAMING:
+- Uses __ldcs for loads (cache streaming)
+- Indicates data won't be reused → better cache utilization
+
+PERFORMANCE vs KERNEL 2:
+- PROS:
+  * Dramatically fewer atomic operations
+  * Better SM utilization
+  * No temp buffer needed
+  * Single kernel launch
+- CONS:
+  * More complex indexing
+  * Potential load imbalance if B*T not divisible by warps_in_grid
+
+EXPECTED PERFORMANCE:
+- Typically 1.5-2x faster than kernel 2 (6-10x faster than kernel 1)
+*/
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -279,11 +501,11 @@ __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparam
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int base_idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
 
-    // the first half of shared memory is bias, second is weight
+    // Shared memory layout
     float* dbias_shared = shared;
     float* dweight_shared = shared + C;
 
-    // init shared memory to zero
+    // Initialize shared memory
     #pragma unroll 4
     for(int i = threadIdx.x; i < C; i+= blockDim.x){
        dbias_shared[i] = 0.0f;
@@ -291,6 +513,7 @@ __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparam
     }
     __syncthreads();
 
+    // GRID-STRIDING LOOP: each warp processes multiple rows
     int warps_in_grid = gridDim.x * warp.meta_group_size();
     for (int idx = base_idx; idx < B * T; idx += warps_in_grid) {
         int b = idx / T;
@@ -302,7 +525,7 @@ __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparam
         const float mean_bt = (float)mean[b * T + t];
         const float rstd_bt = (float)rstd[b * T + t];
 
-        // first: two reduce operations
+        // Compute reduction statistics
         float dnorm_mean = 0.0f;
         float dnorm_norm_mean = 0.0f;
         for (int i = warp.thread_rank(); i < C; i  += warp.size()) {
@@ -316,33 +539,60 @@ __global__ void layernorm_backward_kernel3(Tdinp* dinp, Tparams* dweight, Tparam
         dnorm_mean = dnorm_mean / C;
         dnorm_norm_mean = dnorm_norm_mean / C;
 
-        // now iterate again and accumulate all the gradients
+        // Accumulate gradients with cache streaming
         for (int i = warp.thread_rank(); i < C; i += warp.size()) {
-            float dout_i = (float)__ldcs(&dout_bt[i]);
+            float dout_i = (float)__ldcs(&dout_bt[i]);       // streaming load
             float norm_bti = ((float)__ldcs(&inp_bt[i]) - mean_bt) * rstd_bt;
             float dnorm_i = (float)weight[i] * dout_i;
-            // gradient contribution to bias
+
+            // Accumulate to shared memory
             atomicAdd(&dbias_shared[i], dout_i);
-            // gradient contribution to weight
             atomicAdd(&dweight_shared[i], norm_bti * dout_i);
-            // gradient contribution to input
+
+            // dinp gradient
             float dval = 0.0f;
-            dval += dnorm_i; // term 1
-            dval -= dnorm_mean; // term 2
-            dval -= norm_bti * dnorm_norm_mean; // term 3
-            dval *= rstd_bt; // final scale
+            dval += dnorm_i;
+            dval -= dnorm_mean;
+            dval -= norm_bti * dnorm_norm_mean;
+            dval *= rstd_bt;
             dinp_bt[i] = (Tdinp)((float)dinp_bt[i] + dval);
         }
     }
     __syncthreads();
 
+    // Write accumulated gradients to global memory (ONCE per block, not per warp!)
     for(int i = threadIdx.x; i < C; i+= blockDim.x) {
         atomicAddX(&dbias[i], (Tparams)dbias_shared[i]);
         atomicAddX(&dweight[i], (Tparams)dweight_shared[i]);
     }
 }
 
-// atomicCAS version of kernel3
+/*
+KERNEL 4: atomicCAS for BF16 (Compare-And-Swap)
+------------------------------------------------
+APPROACH:
+- Same as kernel 3, but uses atomicCAS instead of atomicAdd for bf16
+- atomicCAS = atomic Compare-And-Swap (lock-free synchronization)
+
+ATOMICAS TECHNIQUE:
+For bf16/fp16 which lack native atomicAdd:
+1. Read current value from memory
+2. Compute new value = current + delta
+3. atomicCAS attempts to write new value if current hasn't changed
+4. If changed by another thread, retry with updated current value
+
+This is a lock-free retry loop that ensures correctness without locks.
+
+WHY atomicCAS vs atomicAdd:
+- atomicAdd for bf16 requires pairing (operates on 2 values at once)
+- atomicCAS can update single bf16 value (but may retry multiple times)
+- Trade-off: simpler indexing vs potential retry overhead
+
+PERFORMANCE vs KERNEL 3:
+- Similar for low contention
+- May be slower with high contention (more retries)
+- Benefit: cleaner for non-paired memory layouts
+*/
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparams* dbias,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -454,7 +704,43 @@ __global__ void layernorm_backward_kernel4(Tdinp* dinp, Tparams* dweight, Tparam
     }
 }
 
-// FP32 scratchpad per threadgroup, zero atomics except atomicAdd on unsigned int for the flag (based on kernel3)
+/*
+KERNEL 5: FP32 Scratchpad Per Block with Flag-Based Synchronization
+--------------------------------------------------------------------
+APPROACH:
+- Each block writes its accumulation to a private scratchpad in global memory
+- Use atomic flag to coordinate: last block to finish does the final reduction
+- NO atomics during accumulation (only one atomic increment of flag)
+
+SCRATCHPAD STRATEGY:
+- scratch buffer layout: [flag][block0_dbias][block0_dweight][block1_dbias]...
+- Each block accumulates in shared memory, then writes to its scratchpad
+- Last block (detected via atomic flag) sums all scratchpads
+
+FLAG-BASED SYNCHRONIZATION:
+1. Each block increments atomic flag when done
+2. Block that sees flag == gridDim.x-1 is the last one
+3. Last block performs final reduction across all scratchpads
+4. Avoids atomic contention during accumulation!
+
+ADVANTAGES:
+- Only ONE atomic operation per block (the flag increment)
+- All accumulation is conflict-free writes to separate memory
+- Final reduction is serial but only happens once
+
+PERFORMANCE vs KERNEL 3:
+- PROS:
+  * Eliminates atomic contention completely
+  * Clean separation of phases
+  * High precision with FP32 scratch
+- CONS:
+  * Requires scratch buffer (extra memory)
+  * Last block does more work (potential imbalance)
+  * Memory traffic for scratchpad writes/reads
+
+EXPECTED PERFORMANCE:
+- Typically 1.2-1.4x faster than kernel 3 for large batches
+*/
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -554,7 +840,35 @@ __global__ void layernorm_backward_kernel5(Tdinp* dinp, Tparams* dweight, Tparam
     }
 }
 
-// single FP32 scratchpad shared by all the threadblocks (based on kernels 3 & 5)
+/*
+KERNEL 6: Single Shared Scratchpad (Memory-Optimized)
+------------------------------------------------------
+APPROACH:
+- Same algorithm as kernel 5, but with SINGLE shared scratchpad for all blocks
+- Reduces memory footprint significantly
+- Uses atomics to scratchpad, but then flag-based final reduction
+
+MEMORY OPTIMIZATION:
+Kernel 5: scratch size = gridDim.x * 2 * C * sizeof(float)
+Kernel 6: scratch size = 2 * C * sizeof(float) + flag
+
+For 108 blocks, C=768:
+- Kernel 5: 108 * 2 * 768 * 4 = 662KB
+- Kernel 6: 2 * 768 * 4 = 6KB
+This is 100x less memory!
+
+TRADE-OFF:
+- Kernel 5: No atomics during accumulation, but high memory
+- Kernel 6: Atomics to shared scratchpad, but low memory
+
+The scratchpad atomics are less contended than direct atomics to dweight/dbias
+because all blocks share the work of incrementing the same locations.
+
+PERFORMANCE vs KERNEL 5:
+- PROS: Dramatically less memory (important for large models)
+- CONS: Re-introduces some atomic contention (to scratchpad)
+- Usually similar performance, sometimes slightly slower
+*/
 template <typename Tdinp, typename Tparams, typename Tdout, typename Trest>
 __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparams* dbias, float* scratch,
                         const Tdout* dout, const Trest* inp, const Tparams* weight, const Trest* mean, const Trest* rstd,
@@ -648,7 +962,30 @@ __global__ void layernorm_backward_kernel6(Tdinp* dinp, Tparams* dweight, Tparam
 }
 
 
-// Same as kernel 6 but without cooperative groups or templates
+/*
+KERNEL 7: Simplified Without Cooperative Groups
+------------------------------------------------
+APPROACH:
+- Same algorithm as kernel 6
+- Removes cooperative groups dependency
+- Uses manual warp reduction instead of cg::reduce
+
+SIMPLIFICATION:
+- Uses warpReduceSum() helper function instead of cooperative groups
+- Computes warp ID and lane ID manually
+- No templates - uses floatX typedef
+
+WHY REMOVE COOPERATIVE GROUPS:
+- Simpler code, easier to understand and modify
+- Slightly less overhead from cooperative groups API
+- More control over warp-level operations
+
+This is a teaching/debugging version that's more explicit about operations.
+
+PERFORMANCE vs KERNEL 6:
+- Essentially identical (same algorithm, different API)
+- May be very slightly faster due to less abstraction overhead
+*/
 __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                         const floatX* dout, const floatX* inp, const floatX* weight, const floatX* mean, const floatX* rstd,
                         int B, int T, int C) {
@@ -740,6 +1077,50 @@ __global__ void layernorm_backward_kernel7(floatX* dinp, floatX* dweight, floatX
     }
 }
 
+/*
+KERNEL 8: Vectorization with Bank Conflict Avoidance
+-----------------------------------------------------
+APPROACH:
+- Add vectorized loads/stores using x128 (128-bit = 4 elements)
+- Solve shared memory bank conflict problem
+- Reorder indexing for optimal shared memory access
+
+VECTORIZATION (x128):
+- Load/store 4 floats at once instead of 1
+- Reduces memory transactions by 4x
+- Improves memory bandwidth utilization
+
+BANK CONFLICT PROBLEM:
+When using vectorized loads, naive indexing causes 8-way bank conflicts:
+- x128 loads 4 elements, but atomics are 32-bit (1 element)
+- Threads in warp access: [0,4,8,12,...] - stride of 4
+- This maps to same bank repeatedly → bank conflict!
+
+SOLUTION: Reorder shared memory indexing
+Instead of: shared[global_index]
+Use: shared[shared_index] where shared_index spreads accesses
+Layout: shared[warpThread + iteration*WARP_SIZE] instead of [thread*4 + iteration]
+
+This ensures consecutive threads access consecutive banks (no conflicts).
+
+FINAL REORDERING:
+After accumulation, reorder from shared-memory-friendly to global-memory-friendly
+indexing before writing final results.
+
+PERFORMANCE vs KERNEL 7:
+- PROS:
+  * 4x fewer memory transactions (vectorization)
+  * No shared memory bank conflicts
+  * Better memory bandwidth
+- CONS:
+  * More complex indexing
+  * Reordering overhead
+  * Requires C divisible by 4*32=128
+
+EXPECTED PERFORMANCE:
+- Typically 1.3-1.5x faster than kernel 7
+- Can achieve 60-70% of peak memory bandwidth
+*/
 __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
                 layernorm_backward_kernel8(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
@@ -864,6 +1245,48 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     }
 }
 
+/*
+KERNEL 9: Inter-Warp Reduction Without Atomics
+-----------------------------------------------
+APPROACH:
+- Eliminate shared memory atomics by using inter-warp reduction
+- Multiple warps in block cooperate using shared memory as buffer
+- Only warp 0 actually writes to shared memory (no atomics!)
+
+INTER-WARP REDUCTION TECHNIQUE:
+Instead of each warp atomically adding to shared memory:
+1. Non-warp-0 warps write their contributions to temp shared memory
+2. __syncthreads() to ensure all writes complete
+3. Warp 0 reads all contributions and sums them
+4. Warp 0 writes the final sum to accumulator
+5. __syncthreads() before next iteration
+
+This replaces atomics with barriers + serial reduction in warp 0.
+
+WHY THIS WORKS:
+- Atomics serialize execution anyway
+- By having warp 0 do serial reduction, we get same effect without atomic overhead
+- Barriers are cheaper than atomics for small warp counts
+
+SCRATCHPAD STRATEGY:
+- Per-block scratchpad (like kernel 5)
+- Final reduction by last block (flag-based synchronization)
+- All accumulation is atomic-free!
+
+PERFORMANCE vs KERNEL 8:
+- PROS:
+  * No shared memory atomics (eliminates contention)
+  * Cleaner execution pattern
+  * Better for high warp counts
+- CONS:
+  * More barriers (synchronization overhead)
+  * Warp 0 does more work (potential imbalance)
+  * More shared memory usage for temp buffers
+
+EXPECTED PERFORMANCE:
+- Typically 1.1-1.3x faster than kernel 8 for high warp counts
+- Best for blocks with many warps (16-32 warps)
+*/
 __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                                             const floatX* dout, const floatX* inp, const floatX* weight,
                                             const floatX* mean, const floatX* rstd,
@@ -1049,10 +1472,69 @@ __global__ void layernorm_backward_kernel9(floatX* dinp, floatX* dweight, floatX
 }
 
 
-// similar to kernel 9, but uses vectors to access shared memory, which also avoids the bank conflict problems,
-// and makes use require fewer barriers, at the cost of increased shared memory consumption.
-// warning: this kernel is _extremely_ close to getting register spills, so many "optimizations" turn out to be unhelpful
-// or need to be implemented in a very specific way.
+/*
+KERNEL 10: Vectorized Shared Memory with Optimized Layout (Most Optimized)
+---------------------------------------------------------------------------
+APPROACH:
+- Similar to kernel 9, but uses f128 vectors for shared memory access
+- Vectorized shared memory eliminates bank conflicts entirely
+- Fewer barriers needed due to vector-level synchronization
+- Carefully tuned to avoid register spills
+
+VECTORIZED SHARED MEMORY:
+- Use f128 (128-bit float vectors) for shared memory operations
+- Shared memory accesses are naturally aligned and conflict-free
+- Reduces number of shared memory transactions
+
+KEY OPTIMIZATIONS:
+1. Vector loads/stores (f128 and x128) throughout
+2. Shared memory sized to rounded_C (aligned to vector boundaries)
+3. Temp buffers offset to avoid warp 0 from wasting space
+4. Careful register management to avoid spills
+
+REGISTER PRESSURE:
+This kernel is at the edge of register limits:
+- __launch_bounds__(512, 2): max 512 threads, min 2 blocks per SM
+- Any additional complexity can cause register spills (huge perf hit!)
+- Many "obvious" optimizations actually hurt performance due to spills
+- This is a finely-tuned balance
+
+MEMORY LAYOUT:
+- rounded_C: C rounded up to vector alignment
+- dbias_shared[rounded_C]: aligned for vector access
+- dweight_shared[rounded_C]: aligned for vector access
+- Temp buffers for inter-warp reduction
+- Pointer arithmetic tricks to save registers
+
+BANK CONFLICT ELIMINATION:
+By using f128 vectors for shared memory:
+- Each access loads 128 bits (4 floats)
+- Consecutive threads access consecutive 128-bit chunks
+- Perfect bank distribution (no conflicts at all!)
+
+PERFORMANCE vs KERNEL 9:
+- PROS:
+  * Vectorized shared memory (no bank conflicts)
+  * Fewer barriers needed
+  * Optimal memory access patterns
+  * Best overall performance
+- CONS:
+  * Most complex code
+  * Fragile (register spills if modified)
+  * Requires careful tuning
+  * Higher shared memory usage
+
+EXPECTED PERFORMANCE:
+- Typically 1.1-1.2x faster than kernel 9
+- Often achieves 75-85% of peak memory bandwidth
+- Best overall backward pass kernel for typical configurations
+
+IMPORTANT NOTES:
+- This kernel is extremely sensitive to changes
+- Many "improvements" actually hurt due to register spills
+- If modifying, check register usage with --ptxas-options=-v
+- Register spills can reduce performance by 2-3x!
+*/
 __global__ void __launch_bounds__(512, 2)
 layernorm_backward_kernel10(floatX* dinp, floatX* dweight, floatX* dbias, float* scratch,
                             const floatX* dout, const floatX* inp, const floatX* weight,

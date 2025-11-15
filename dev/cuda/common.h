@@ -1,3 +1,57 @@
+/*
+================================================================================
+common.h - Common CUDA Utilities and Helper Functions
+================================================================================
+
+PURPOSE:
+--------
+Provides reusable utilities for CUDA kernel development and testing:
+  - Error checking macros (CUDA, cuBLAS)
+  - Reduction primitives (warp-level, block-level)
+  - Packed data structures for vectorized memory access
+  - Random data generation for testing
+  - Result validation and benchmarking infrastructure
+  - cuBLAS/cuBLASLt initialization and configuration
+
+USAGE:
+------
+Include this header in any CUDA kernel file that needs these utilities:
+  #include "common.h"
+
+This header is included by most kernel files in the dev/cuda/ directory.
+
+KEY COMPONENTS:
+---------------
+1. Error Checking:
+   - cudaCheck(err): Check CUDA API calls
+   - cublasCheck(status): Check cuBLAS API calls
+
+2. Reduction Primitives:
+   - warpReduceSum/Max: Fast warp-level reductions using shuffle
+   - blockReduce<T>: Block-level reduction with shared memory
+
+3. Memory Access:
+   - Packed128<T>: 128-bit aligned loads/stores for coalescing
+   - load128/store128: Vectorized memory operations
+   - load128cs/store128cs: With cache streaming hints
+
+4. Testing Infrastructure:
+   - make_random_float/int: Generate test data
+   - validate_result: Compare GPU vs CPU results
+   - benchmark_kernel: Measure kernel performance
+
+5. cuBLAS Setup:
+   - setup_main(): Initialize cuBLAS and get device properties
+   - Global handles: cublas_handle, cublaslt_handle
+
+DESIGN PHILOSOPHY:
+------------------
+- Header-only for easy inclusion
+- Template-based for type flexibility
+- Minimal dependencies (CUDA runtime, cuBLAS only)
+- Educational: Clear code over maximum optimization
+*/
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -6,48 +60,180 @@
 #include <float.h>
 
 #define WARP_SIZE 32U
+
+// Global device properties (set by setup_main())
 extern cudaDeviceProp deviceProp;
 
+/*
+================================================================================
+Basic Utility Functions
+================================================================================
+*/
+
+/*
+Integer ceiling division.
+
+Computes ceil(dividend / divisor) for integer types.
+Avoids floating point conversion and is exact for integers.
+
+Example:
+  ceil_div(10, 3) = 4 (since 10/3 = 3.33... rounds up to 4)
+  ceil_div(9, 3) = 3 (exact division)
+
+Common use: Calculating number of blocks needed to cover all threads:
+  int num_blocks = ceil_div(total_threads, block_size);
+*/
 template<class T>
 __host__ __device__ T ceil_div(T dividend, T divisor) {
     return (dividend + divisor-1) / divisor;
 }
 
+/*
+================================================================================
+Warp-Level Reduction Primitives
+================================================================================
+
+These functions perform reductions across all 32 threads in a warp using
+warp shuffle instructions, which are very fast (single instruction).
+
+WARP SHUFFLE:
+-------------
+__shfl_xor_sync exchanges values between threads in a warp without shared memory:
+  - Very fast (single clock cycle)
+  - No memory access
+  - No synchronization overhead
+
+ALGORITHM (butterfly reduction):
+---------------------------------
+Starting with each thread holding a value:
+  Step 1: Each thread exchanges with thread 16 away (offset=16)
+  Step 2: Each thread exchanges with thread 8 away (offset=8)
+  Step 3: offset=4, then 2, then 1
+  Result: Thread 0 holds the sum of all 32 values
+
+Visual example (8 threads, for simplicity):
+  Initial: [a, b, c, d, e, f, g, h]
+  offset=4: [a+e, b+f, c+g, d+h, e+a, f+b, g+c, h+d]
+  offset=2: [a+c+e+g, b+d+f+h, c+a+g+e, d+b+h+f, ...]
+  offset=1: [a+b+c+d+e+f+g+h, a+b+c+d+e+f+g+h, ...]
+*/
+
+/*
+Warp-level sum reduction using shuffle instructions.
+
+All 32 threads in the warp must call this function.
+After execution, all threads have the sum, but typically only thread 0 uses it.
+
+Parameters:
+  val: Value from this thread
+
+Returns:
+  Sum of val across all 32 threads in the warp
+
+Requirement: All threads in warp must be active (0xFFFFFFFF mask)
+*/
 __device__ float warpReduceSum(float val) {
+    // Butterfly reduction pattern
     for (int offset = 16; offset > 0; offset /= 2) {
+        // Each thread exchanges with thread (threadIdx.x XOR offset)
+        // Then adds the received value to its own
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
 
-// requires all 32 threads in the warp to be active, but should work for any block size
-// uses non-dynamic shared memory so every call increases shared memory requirements by 128 bytes
-// the fact it's unique shared memory allows us to avoid an extra __syncthreads() call at the end
-// but if called inside a loop, the shared memory will be implicitly reused, so set final_sync to 1
+/*
+================================================================================
+Block-Level Reduction Template
+================================================================================
+
+Reduces a value across ALL threads in a block (up to 1024 threads).
+
+ALGORITHM:
+----------
+Three-stage reduction:
+  1. Warp-level: Each warp reduces using shuffle (fast)
+  2. Cross-warp: Warp leaders write to shared memory, sync, read back
+  3. Final warp: First warp reduces the per-warp results
+
+SHARED MEMORY:
+--------------
+Uses 32 floats of shared memory (128 bytes).
+This is unique per call site (static allocation), which avoids needing
+an extra __syncthreads() at the end (unless called in a loop).
+
+If called in a loop, shared memory is reused, so set final_sync=true.
+
+TEMPLATE PARAMETER:
+-------------------
+warp_reduction: Function pointer to warp reduction (warpReduceSum or warpReduceMax)
+  Allows this template to work for different reduction operations.
+
+PARAMETERS:
+-----------
+val: Value from this thread to reduce
+final_sync: Whether to synchronize at end (true if called in loop)
+out_of_bounds: Value to use for threads beyond num_warps (usually 0.0f or -FLT_MAX)
+
+EXAMPLE USAGE:
+--------------
+  float sum = blockReduce<warpReduceSum>(my_value);  // All threads get sum
+  if (threadIdx.x == 0) {
+      output[blockIdx.x] = sum;  // Only thread 0 writes
+  }
+
+REQUIREMENTS:
+-------------
+- All threads in block must call this
+- warp_reduction function must return same value to all threads in warp
+*/
 using reduction_func_t = float (*) (float);
 
 template<reduction_func_t warp_reduction>
 __device__ inline float blockReduce(float val, bool final_sync, float out_of_bounds) {
-    // two reductions of up to 1024 threads:
-    // 1) inside warp (shuffle), 2) cross-warp (shared memory), 3) inside warp (shuffle)
+    // Shared memory for storing per-warp results (one per warp in block)
     __shared__ float shared_val[WARP_SIZE];
-    const int lane_id = threadIdx.x % WARP_SIZE;
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int num_warps = blockDim.x / WARP_SIZE;
 
+    const int lane_id = threadIdx.x % WARP_SIZE;      // Thread index within warp (0-31)
+    const int warp_id = threadIdx.x / WARP_SIZE;       // Warp index within block
+    const int num_warps = blockDim.x / WARP_SIZE;     // Number of warps in block
+
+    // ===================================================================
+    // Stage 1: Reduce within each warp
+    // ===================================================================
     float warp_val = warp_reduction(val);
+
+    // Warp leader (lane 0) writes warp result to shared memory
     if (lane_id == 0) { shared_val[warp_id] = warp_val; }
+
+    // Wait for all warps to write their results
     __syncthreads();
+
+    // ===================================================================
+    // Stage 2: Reduce across warps (warp 0 only)
+    // ===================================================================
+    // Each thread in warp 0 loads one warp's result
+    // Threads beyond num_warps load out_of_bounds value
     warp_val = (lane_id < num_warps) ? shared_val[lane_id] : out_of_bounds;
+
+    // Warp 0 reduces to get final block result
     float block_val = warp_reduction(warp_val);
 
+    // ===================================================================
+    // Optional final sync
+    // ===================================================================
+    // If called in loop, shared memory will be reused, so we need to sync
     if (final_sync) {
-        __syncthreads(); // only needed in loops when effectively reusing shared memory etc.
+        __syncthreads();
     }
-    return block_val;
+
+    return block_val;  // All threads return same value (from lane 0 of warp 0)
 }
 
-// Helper function to call blockReduce with default arguments
+/*
+Convenience wrapper with default parameters.
+Most common use case: no loop, sum reduction starting from 0.
+*/
 template<reduction_func_t warp_reduction>
 __device__ inline float blockReduce(float val) {
     return blockReduce<warp_reduction>(val, false, 0.0f);
@@ -76,20 +262,38 @@ void cublasCheck(cublasStatus_t status, const char *file, int line)
 }
 #define cublasCheck(status) { cublasCheck((status), __FILE__, __LINE__); }
 
-// ----------------------------------------------------------------------------
-// cuBLAS setup
-// these will be initialized by setup_main
+/*
+================================================================================
+cuBLAS Configuration and Global State
+================================================================================
 
-// cuBLAS workspace. Hardcoding to 32MiB but only Hopper needs 32, for others 4 is OK
+These globals are initialized by setup_main() and used throughout kernels.
+*/
+
+// cuBLAS workspace buffer
+// Hopper (H100) needs 32MB, older GPUs need only 4MB
+// Used by cuBLASLt for temporary storage during matrix multiplications
 static size_t cublaslt_workspace_size = 32 * 1024 * 1024;
 static void* cublaslt_workspace = NULL;
+
+// Compute type for cuBLAS operations
+// Either CUBLAS_COMPUTE_32F or CUBLAS_COMPUTE_32F_FAST_TF32
 static cublasComputeType_t cublas_compute_type;
-cublasHandle_t cublas_handle;
-cublasLtHandle_t cublaslt_handle;
-int cuda_arch_major = 0;
-int cuda_arch_minor = 0;
-int cuda_num_SMs = 0; // for persistent threads where we want 1 threadblock per SM
-int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch to fill up the GPU
+
+// cuBLAS handles for matrix operations
+cublasHandle_t cublas_handle;        // Standard cuBLAS API
+cublasLtHandle_t cublaslt_handle;    // cuBLASLt (more flexible, better performance)
+
+// GPU architecture information (from cudaDeviceProp)
+int cuda_arch_major = 0;              // e.g., 8 for Ampere (A100), 9 for Hopper (H100)
+int cuda_arch_minor = 0;              // Minor version number
+
+// GPU capability metrics
+int cuda_num_SMs = 0;                 // Number of streaming multiprocessors
+                                       // Used for persistent kernels (1 block per SM)
+
+int cuda_threads_per_SM = 0;          // Max threads per SM (e.g., 2048 for A100)
+                                       // Used to calculate grid size to fill GPU
 
 // ----------------------------------------------------------------------------
 // to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
@@ -99,11 +303,65 @@ int cuda_threads_per_SM = 0;    // needed to calculate how many blocks to launch
 #define MAX_1024_THREADS_BLOCKS 1
 #endif
 
-// ----------------------------------------------------------------------------
-// Packed128 data structure, which forces the compiler to use 128-bit loads/stores
-// in GPUs that support (the LDG.128 and STS.128 instructions)
-// This is a bit similar to the use of float4 in the case of 32-bit floats, but
-// supports arbitrary precision.
+/*
+================================================================================
+Packed128: Vectorized Memory Access Template
+================================================================================
+
+PURPOSE:
+--------
+Forces the compiler to use 128-bit (16-byte) memory transactions, which are
+the most efficient on modern GPUs.
+
+WHY 128-BIT LOADS?
+------------------
+GPU memory controllers work most efficiently with:
+  - 32-bit (4 byte) - baseline
+  - 64-bit (8 byte) - 2x faster
+  - 128-bit (16 byte) - 4x faster (best!)
+
+A 128-bit load in a single instruction reads:
+  - 4 × float (32-bit each)
+  - 8 × half/bf16 (16-bit each)
+  - 16 × int8 (8-bit each)
+
+MEMORY BANDWIDTH:
+-----------------
+Example: Reading 1M floats
+  - Individual loads: 1M transactions
+  - float4 (128-bit): 250K transactions → 4x less overhead
+
+COMPARISON TO float4:
+---------------------
+float4 is hardcoded for 32-bit floats.
+Packed128 works with ANY type (float, half, bfloat16, etc.) while still
+forcing 128-bit loads/stores.
+
+REQUIREMENTS:
+-------------
+1. Data must be 16-byte aligned in memory
+2. Access patterns should be coalesced (consecutive threads → consecutive addresses)
+
+TEMPLATE PARAMETER:
+-------------------
+ElementType: Type of individual elements (float, __nv_bfloat16, half, etc.)
+
+USAGE EXAMPLE:
+--------------
+  // Define type alias for convenience
+  using f128 = Packed128<float>;  // Holds 4 floats
+
+  // Load 4 consecutive floats in one instruction
+  f128 data = load128(array_ptr);
+
+  // Access individual elements
+  float x = data[0];
+  float y = data[1];
+
+  // Modify and store back
+  data[0] = x * 2.0f;
+  store128(output_ptr, data);
+*/
 
 template<class ElementType>
 struct alignas(16) Packed128 {

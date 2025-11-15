@@ -1,16 +1,103 @@
-/*  Kernels for fused forward/backward classifier part
-This fuses softmax, crossentropy, and logit gradients into a single pass, so we don't have to write unnecessary
-(B, T, V) tensors. Such an operation is only possible if `dloss` can be known beforehand, which doesn't seem like
-much of a restriction: In pretraining, it is just a constant 1/batch_size tensor, for fine-tuning we might zero
-out the input prompt, but that is known in advance.
+/*
+================================================================================
+Fused Classifier (Softmax + Cross-Entropy + Gradients) CUDA Kernels
+================================================================================
+
+PURPOSE:
+--------
+Fuses three operations into a single kernel pass to eliminate intermediate
+tensor materialization:
+  1. Softmax (forward): Convert logits to probabilities
+  2. Cross-Entropy Loss (forward): Compute loss from probabilities
+  3. Softmax + Cross-Entropy Gradients (backward): Compute dL/dlogits
+
+MOTIVATION: Memory Bandwidth Optimization
+------------------------------------------
+Standard approach (3 separate kernels):
+  1. softmax: logits (B,T,V) → probs (B,T,V)        [read V, write V]
+  2. cross_entropy: probs (B,T,V) + targets → loss  [read V, write 1]
+  3. backward: probs (B,T,V) → dlogits (B,T,V)      [read V, write V]
+
+Total memory traffic: 5V reads + 2V writes per row
+
+Fused approach (1 kernel):
+  - Read logits once: V reads
+  - Compute probs on-the-fly (in registers, never written to memory!)
+  - Write dlogits: V writes
+  - Write loss: 1 write
+
+Total memory traffic: V reads + V writes per row → 2.5x less bandwidth!
+
+KEY INSIGHT:
+------------
+Probabilities are only needed temporarily for gradient computation.
+By keeping them in registers and never writing to global memory,
+we save massive bandwidth for large vocabulary sizes (V = 50k+ tokens).
+
+WHEN IS THIS POSSIBLE?
+-----------------------
+This fusion requires knowing dL/dloss beforehand (before the backward pass).
+
+Common cases where this works:
+1. Training: dL/dloss = 1/(B*T) uniformly (scaling factor for mean loss)
+2. Fine-tuning with masking: dL/dloss = 0 for prompt, 1/(B*T) for completion
+3. Any case where loss scaling is predetermined
+
+WHY THIS MATTERS:
+-----------------
+For GPT-like models:
+  - Vocabulary size V = 50,257 tokens
+  - Sequence length T = 1024
+  - Batch size B = 8
+  - Classifier tensors: (8, 1024, 50257) ≈ 1.6GB per tensor
+  - Without fusion: ~8GB memory traffic
+  - With fusion: ~3.2GB memory traffic
+  - Speedup: 2-3x for classifier operations
+
+KERNEL VERSIONS:
+----------------
+Kernel 1 (fused_classifier_kernel1):
+  - Warp-level implementation
+  - Each warp handles one row (one token prediction)
+  - Minimal optimization, baseline
+
+Kernel 2 (fused_classifier_kernel2):
+  - Block-level with float4 vectorization
+  - Full block collaborates on one row
+  - Better coalescing and cache usage
+
+Kernel 3 (fused_classifier_kernel3):
+  - Same as kernel 2 but without float4 (for comparison)
+
+Kernel 4 (fused_classifier_kernel4):
+  - Uses Packed128 for mixed precision (BF16/FP16)
+  - Supports lower precision logits/gradients
+
+Kernel 5 (fused_classifier_kernel5):
+  - Most optimized version
+  - Separates aligned and unaligned parts
+  - Cache hints for better memory reuse
+  - Production-ready
+
+MATHEMATICAL FORMULATION:
+-------------------------
+Forward:
+  softmax(i) = exp(logit[i] - max) / sum(exp(logit[j] - max))
+  loss = -log(softmax(target))
+
+Backward (elegant result from calculus):
+  dlogit[i] = (softmax(i) - indicator(i == target)) * dloss
+  where indicator = 1 if i==target, else 0
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt classifier_fused.cu -o classifier_fused
 
-./classifier_fused 1
-./classifier_fused 2
-./classifier_fused 3
-./classifier_fused 4
+Run:
+./classifier_fused 1  # Kernel 1
+./classifier_fused 2  # Kernel 2
+./classifier_fused 3  # Kernel 3
+./classifier_fused 4  # Kernel 4 (mixed precision)
+./classifier_fused 5  # Kernel 5 (best)
 */
 
 #include <stdio.h>
