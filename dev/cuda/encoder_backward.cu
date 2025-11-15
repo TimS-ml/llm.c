@@ -1,5 +1,39 @@
 /*
-Kernels for the positional encoder forward pass in GPT-2.
+Kernels for the positional encoder backward pass in GPT-2.
+
+OPERATION OVERVIEW:
+This is the backward pass (gradient computation) for the encoder layer. Given gradients
+flowing back from later layers (dout), we need to compute gradients for the embeddings:
+- dwte: Gradients for token embeddings (to update the vocabulary embedding matrix)
+- dwpe: Gradients for position embeddings (to update the position embedding matrix)
+
+During forward pass we computed: out = wte[token_id] + wpe[position]
+During backward pass we receive: dout (gradient w.r.t. output)
+We need to compute: dwte[token_id] += dout  and  dwpe[position] += dout
+
+The += is crucial: multiple tokens can be the same word, so their gradients accumulate.
+
+ROLE IN TRANSFORMER:
+The encoder backward pass is where the model learns better word representations. The
+gradients tell us how to adjust each word's embedding vector to reduce the loss. This is
+how the model learns that "king" and "queen" should have similar embeddings, or that
+"good" and "bad" should be different.
+
+WHY MULTIPLE KERNEL VERSIONS:
+The backward pass has a unique challenge: gradient accumulation. Multiple positions might
+use the same token, so we need atomic operations to safely accumulate gradients.
+
+- Version 1: Fine-grained parallelism with atomics
+             Parallelizes over B,T,C and uses atomicAdd for safe accumulation
+             Fast despite atomics because conflicts are rare (vocabulary is large)
+
+- Version 2: Coarse-grained parallelism without atomics
+             Parallelizes only over C, loops over B,T sequentially
+             Avoids atomics but severely underutilizes GPU (only C threads)
+             Much slower - demonstrates that avoiding atomics isn't always better!
+
+This shows an important lesson: atomic operations on GPUs are quite efficient when
+contention is low, and algorithmic parallelism often matters more than avoiding atomics.
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt encoder_backward.cu -o encoder_backward
@@ -43,7 +77,44 @@ void encoder_backward_cpu(float* dwte, float* dwpe,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// naive implementation with atomics
+// KERNEL 1: Fine-grained parallelism with atomic operations
+//
+// ALGORITHM:
+// - Each thread handles one gradient element: dout[b,t,c]
+// - Looks up which token is at position (b,t) to find where to accumulate
+// - Atomically adds gradient to both dwte[token_id,c] and dwpe[t,c]
+//
+// WHY ATOMICS ARE NEEDED:
+// Multiple sequence positions might have the same token (e.g., "the" appears many times).
+// Without atomics, concurrent writes would race and lose gradient information.
+// Example: Thread 1 and Thread 2 both try to update dwte["the",5] simultaneously
+//          Without atomicAdd: One write would be lost (race condition)
+//          With atomicAdd: Both gradients properly accumulate
+//
+// PARALLELIZATION:
+// - Launch B*T*C threads (one per gradient element)
+// - Maximum parallelism, fully saturates GPU
+//
+// MEMORY ACCESS PATTERN:
+// - Reads: Sequential access to dout, random access to inp
+// - Writes: Random atomic writes to dwte (depends on token distribution)
+//           Semi-random atomic writes to dwpe (many positions update same t)
+// - Atomic contention is low for dwte (vocabulary is large, ~50K tokens)
+// - Atomic contention can be higher for dwpe (only T positions, typically 1024-2048)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Excellent (B*T*C threads, typically millions)
+// - Atomic overhead: Moderate but acceptable
+//   * dwte atomics: Low contention (spread across ~50K locations)
+//   * dwpe atomics: Higher contention (concentrated in T locations)
+// - Memory bandwidth: Good (mostly limited by random atomic writes)
+// - Best for: All practical cases (default choice)
+//
+// OPTIMIZATION NOTES:
+// - Modern GPUs handle atomicAdd efficiently, especially for float32
+// - The high parallelism outweighs the atomic overhead
+// - Atomic performance degrades with contention, but vocabulary size keeps it low
+//
 __global__ void encoder_backward_kernel1(float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
                                         int B, int T, int C) {
@@ -67,8 +138,40 @@ __global__ void encoder_backward_kernel1(float* dwte, float* dwpe,
     }
 }
 
-// naive implementation that parallelizes over C and loops over B,T
-// but it gets rid of atomics
+// KERNEL 2: Coarse-grained parallelism avoiding atomics (SLOWER - for comparison)
+//
+// ALGORITHM:
+// - Each thread handles one channel dimension c across ALL (B,T) positions
+// - Loops sequentially over all B*T positions
+// - No atomics needed because each thread has exclusive ownership of column c
+//
+// WHY NO ATOMICS:
+// Since each thread processes a different channel c, and we loop over B,T serially,
+// no two threads ever write to the same memory location. This eliminates races.
+//
+// PARALLELIZATION:
+// - Launch only C threads (one per channel)
+// - Severely underutilizes GPU (C is typically 768-12288, but GPUs have 1000s of cores)
+// - Each thread does B*T iterations (e.g., 8*1024 = 8192 iterations)
+//
+// MEMORY ACCESS PATTERN:
+// - Strided access pattern (each thread reads every C-th element from dout)
+// - Poor cache locality - each thread's data is spread far apart in memory
+// - Uncoalesced memory reads (threads in a warp access non-contiguous memory)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Very poor (only C threads vs millions available)
+// - Memory bandwidth: Poor (uncoalesced access pattern)
+// - No atomic overhead, but massive parallelism loss
+// - Much slower than kernel1 despite avoiding atomics
+// - Best for: Nothing (included only for educational comparison)
+//
+// LESSON LEARNED:
+// This kernel demonstrates that "avoiding atomics" is not always the right optimization!
+// The loss of parallelism (from B*T*C threads down to just C threads) hurts much more
+// than the atomic overhead in kernel1. On modern GPUs, algorithmic parallelism often
+// trumps low-level optimizations. Always profile rather than assume!
+//
 __global__ void encoder_backward_kernel2(float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
                                         int B, int T, int C) {

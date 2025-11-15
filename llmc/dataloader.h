@@ -1,7 +1,123 @@
 /*
-Implements:
-- DataLoader for model training. Reads and serves data shards.
-- EvalLoader for multiple-choice evaluation datasets, e.g. HellaSwag.
+================================================================================
+File: dataloader.h
+Purpose: Data loading infrastructure for training and evaluation
+================================================================================
+
+Overview:
+---------
+This file implements two data loaders:
+1. DataLoader: For autoregressive language model training (next-token prediction)
+2. EvalLoader: For multiple-choice evaluation (HellaSwag, MMLU, etc.)
+
+Both support distributed training where multiple processes read different
+portions of the data in parallel.
+
+================================================================================
+DATALOADER: TRAINING DATA
+================================================================================
+
+Purpose:
+--------
+Efficiently loads training data shards and serves batches for training.
+Supports:
+- Multi-shard datasets (data split across many .bin files)
+- Distributed training (each GPU reads different data)
+- Data shuffling (both shard-level and intra-shard)
+- Resumption from checkpoints
+
+Data Format:
+-----------
+Each shard is a binary file (.bin) containing:
+- Header (256 int32s):
+  [0]: Magic number (20240520)
+  [1]: Version (1)
+  [2]: Number of tokens in shard
+- Tokens: Sequence of uint16_t token IDs
+
+File Layout:
+-----------
+Training data split across multiple shards:
+- train_000.bin, train_001.bin, ..., train_099.bin
+- Glob pattern: "train_*.bin"
+- DataLoader automatically finds and loads all matching shards
+
+Batching:
+--------
+- Each batch is (B, T+1) tokens: B sequences of T+1 tokens each
+- Input: tokens[0:T]
+- Target: tokens[1:T+1]
+- This is standard next-token prediction setup
+
+Distributed Training:
+--------------------
+When using N GPUs:
+- Each GPU runs a process with rank 0, 1, ..., N-1
+- Total batch size = N * B * T tokens
+- Each process reads its own B*T slice from the shard
+- Example: GPU 0 reads tokens[0:B*T], GPU 1 reads tokens[B*T:2*B*T], etc.
+
+Shuffling:
+---------
+Two levels of shuffling (both optional):
+1. Shard-level: Random order of shards
+2. Intra-shard: Random order of examples within each shard
+Both use Mersenne Twister RNG for reproducibility
+
+================================================================================
+EVALLOADER: EVALUATION DATA
+================================================================================
+
+Purpose:
+--------
+Loads multiple-choice evaluation datasets where the task is to select the
+correct completion from N options (usually 4).
+
+Examples:
+--------
+- HellaSwag: Choose correct sentence continuation
+- MMLU: Multiple-choice questions across many subjects
+- ARC: Science questions with multiple-choice answers
+
+Data Format:
+-----------
+Each example consists of:
+- Context: Shared prompt/question
+- Completions: N candidate answers (usually 4)
+- Label: Index of correct completion (0-3)
+
+Evaluation:
+----------
+1. For each completion, compute average loss over its tokens
+2. Choose completion with lowest loss
+3. Check if it matches the label
+4. Accuracy = fraction of correct choices
+
+Packing:
+-------
+Since each example has 4 completions, and each completion needs a separate
+forward pass, EvalLoader packs multiple examples into a single batch:
+- If B=16 and 4 completions, we can fit 4 examples per batch
+- Each example occupies 4 rows of the batch
+
+Usage Examples:
+--------------
+    // Training
+    DataLoader loader;
+    dataloader_init(&loader, "train_*.bin", B, T, rank, num_processes, shuffle);
+    for (int step = 0; step < num_steps; step++) {
+        dataloader_next_batch(&loader);
+        // Use loader.inputs and loader.targets for training
+    }
+
+    // Evaluation
+    EvalLoader eval;
+    evalloader_init(&eval, "hellaswag_val.bin", B, T, rank, num_processes);
+    for (int batch = 0; batch < eval.num_batches; batch++) {
+        evalloader_next_batch(&eval);
+        // Forward pass, compute losses
+        int correct = evalloader_stat_losses(&eval, losses);
+    }
 */
 #ifndef DATALOADER_H
 #define DATALOADER_H

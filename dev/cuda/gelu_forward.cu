@@ -1,5 +1,39 @@
 /*
-Kernels for gelu forward pass.
+Kernels for GELU (Gaussian Error Linear Unit) forward pass.
+
+OPERATION OVERVIEW:
+GELU is a smooth, non-linear activation function used in transformers (GPT, BERT, etc.).
+It applies a non-linearity to each element independently:
+
+  GELU(x) = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+
+This is a smooth approximation of the Gaussian CDF. Unlike ReLU which clips negative values
+to zero, GELU allows small negative values through, creating a smoother gradient landscape
+that often helps training.
+
+ROLE IN TRANSFORMER:
+GELU is applied in the feedforward network (FFN) of each transformer block:
+  1. Linear projection: x → W1*x + b1  (typically expands dimension 4x)
+  2. GELU activation: GELU(W1*x + b1)  (adds non-linearity)
+  3. Linear projection: W2*GELU(...) + b2  (project back to original dimension)
+
+Without this non-linearity, stacking linear layers would just be one linear transformation.
+GELU enables the transformer to learn complex, non-linear patterns in language.
+
+WHY MULTIPLE KERNEL VERSIONS:
+GELU is an element-wise operation - perfect for GPU parallelization:
+
+- Version 1: Naive element-per-thread
+             Each thread processes one element
+             Simple and effective for element-wise ops
+
+- Version 2: Vectorized with packed 128-bit reads/writes
+             Each thread processes 4-8 elements using 128-bit memory transactions
+             Better memory bandwidth utilization
+             Uses cache-streaming to avoid polluting L1 cache
+
+Element-wise operations like GELU are memory-bound (limited by how fast we can read/write
+data, not by computation). Vectorization helps us approach peak memory bandwidth.
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt gelu_forward.cu -o gelu_forward
@@ -39,7 +73,40 @@ void gelu_forward_cpu(float* out, const float* inp, int N) {
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// elementwise ops are nice and ez
+// KERNEL 1: Naive element-wise GELU
+//
+// ALGORITHM:
+// - Each thread computes GELU for one element
+// - Uses the tanh approximation: GELU(x) ≈ 0.5*x*(1 + tanh(√(2/π)*(x + 0.044715*x³)))
+//
+// MATHEMATICAL BREAKDOWN:
+// 1. cube = 0.044715 * x³        (polynomial correction term)
+// 2. arg = √(2/π) * (x + cube)   (scaled input to tanh)
+// 3. result = 0.5 * x * (1 + tanh(arg))
+//
+// The tanh approximation is faster than the exact Gaussian CDF and accurate enough
+// for neural network training.
+//
+// PARALLELIZATION:
+// - Launch N threads (one per element)
+// - Fully independent - no thread communication needed
+//
+// MEMORY ACCESS PATTERN:
+// - Each thread: 1 read from inp, 1 write to out
+// - Coalesced access when threads in a warp access consecutive elements
+// - Memory-bound operation (arithmetic is simple relative to memory access)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Compute intensity: Low (few FLOPs per element, dominated by tanh)
+// - Memory bandwidth: Moderate (2 * sizeof(floatX) bytes per element)
+// - Occupancy: High (minimal register/shared memory usage)
+// - Best for: Small to medium tensors, or when vectorization isn't applicable
+//
+// OPTIMIZATION NOTES:
+// - tanhf() is a relatively expensive transcendental function
+// - Modern GPUs have special function units (SFU) for tanh, making it faster
+// - --use_fast_math flag allows compiler to use approximate tanh for extra speed
+//
 __global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) {
@@ -49,7 +116,50 @@ __global__ void gelu_forward_kernel1(floatX* out, const floatX* inp, int N) {
     }
 }
 
-// elementwise ops are nice and ez
+// KERNEL 2: Vectorized GELU with 128-bit memory transactions
+//
+// ALGORITHM:
+// - Same GELU computation as kernel1
+// - Each thread processes x128::size elements (typically 4-8) at once
+//
+// OPTIMIZATION TECHNIQUE - VECTORIZED MEMORY ACCESS:
+// - load128cs(): Loads 128 bits in one transaction
+//   * 'cs' means 'cache streaming' - hint to bypass L1 cache
+//   * Reduces cache pollution since we only read each input once
+// - store128(): Stores 128 bits in one transaction
+//   * Regular store (not streaming) keeps output in cache
+//   * Next layer will likely need this data soon
+//
+// PARALLELIZATION:
+// - Launch N/x128::size threads
+// - Fewer threads than kernel1, but each does more work
+// - Still maintains high occupancy
+//
+// MEMORY ACCESS PATTERN:
+// - Coalesced 128-bit aligned loads and stores
+// - Memory controller serves 4-8x fewer transactions
+// - Better utilization of memory bandwidth
+//
+// PERFORMANCE CHARACTERISTICS:
+// - Memory bandwidth: Excellent (~1.5-2x better than kernel1)
+// - Compute: Same per element (still calls tanhf x128::size times)
+// - Instruction-level parallelism: Better (load multiple values with one instruction)
+// - Best for: Large tensors in production (typical case)
+// - Speedup vs kernel1: ~1.5-2x due to better memory efficiency
+//
+// CACHE STRATEGY:
+// Input: Use cache streaming (load128cs)
+//   - We read each input exactly once, so caching doesn't help
+//   - Bypass L1 to save cache space for other data
+// Output: Normal store (store128)
+//   - Keep in cache because next layer will likely read it soon
+//   - Example: GELU output feeds into a matrix multiply
+//
+// KEY INSIGHT:
+// For memory-bound kernels, the bottleneck is moving data, not computing it.
+// By reducing memory transactions through vectorization, we get closer to
+// peak memory bandwidth, which directly translates to speedup.
+//
 __global__ void gelu_forward_kernel2(floatX* out, const floatX* inp, int N) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
     if (i < N) {

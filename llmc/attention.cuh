@@ -1,5 +1,122 @@
 /*
-Attention, as a fallback when we do not use the Flash Attention from cuDNN
+==============================================================================
+Multi-Head Self-Attention Layer
+==============================================================================
+
+PURPOSE:
+Implements multi-head scaled dot-product self-attention, the core mechanism
+of transformer models. This is a fallback implementation used when cuDNN's
+Flash Attention is not available or not used.
+
+MATHEMATICAL OPERATION:
+For input x of shape (B, T, C) where B=batch, T=sequence length, C=channels:
+
+1. Linear projections to Query, Key, Value:
+   Q, K, V = x @ W_q, x @ W_k, x @ W_v  [each: B, T, C]
+
+2. Reshape to multi-head format:
+   Q, K, V -> (B, NH, T, HS) where NH=num_heads, HS=head_size, C=NH*HS
+
+3. Compute attention scores (scaled dot-product):
+   scores = (Q @ K^T) / sqrt(HS)  [shape: B, NH, T, T]
+
+4. Apply causal mask and softmax:
+   attn = softmax(mask(scores))   [only attend to previous positions]
+
+5. Apply attention to values:
+   out = attn @ V                  [shape: B, NH, T, HS]
+
+6. Reshape and concatenate heads:
+   out -> (B, T, C)
+
+This allows the model to attend to different positions in the sequence and
+learn different representation subspaces with different attention heads.
+
+FORWARD PASS ALGORITHM:
+1. permute_kernel: Rearrange QKV from (B, T, 3, NH, HS) to separate Q, K, V
+   tensors of shape (B, NH, T, HS)
+
+2. matmul_cublaslt: Compute Q @ K^T = preatt using batched matrix multiplication
+   - Batch count: B * NH (one matmul per batch and per head)
+   - Output shape: (B, NH, T, T)
+
+3. softmax_forward_kernel5: Apply scaling, causal masking, and softmax
+   - Uses online softmax algorithm for numerical stability
+   - Each warp processes one row (one target position)
+   - Only computes lower triangular (causal) part
+   - Iterates backwards to improve cache locality for next matmul
+
+4. matmul_cublaslt: Compute attn @ V = vaccum
+   - Output shape: (B, NH, T, HS)
+
+5. unpermute_kernel: Rearrange from (B, NH, T, HS) to (B, T, NH, HS) = (B, T, C)
+
+BACKWARD PASS ALGORITHM:
+Gradients flow backwards through each operation:
+
+1. unpermute_kernel_backward: dout (B, T, C) -> dvaccum (B, NH, T, HS)
+
+2. Gradient w.r.t. attention weights:
+   datt = dvaccum @ V^T
+
+3. Gradient w.r.t. values:
+   dV = attn^T @ dvaccum
+
+4. softmax_autoregressive_backward_inplace_kernel:
+   Backprop through softmax with formula:
+   dpreatt[i,j] = attn[i,j] * (datt[i,j] - sum_k(attn[i,k] * datt[i,k]))
+   - In-place: overwrites datt with dpreatt
+   - Handles causal masking by explicitly zeroing non-causal elements
+
+5. Gradient w.r.t. queries and keys:
+   dQ = dpreatt @ K
+   dK = dpreatt^T @ Q
+
+6. permute_kernel_backward: Merge dQ, dK, dV back to (B, T, 3, NH, HS)
+
+CUDA KERNEL IMPLEMENTATIONS:
+
+1. Permute kernels: Simple index transformations, memory-bound
+   - Each thread handles one element
+   - Uses __ldcs for streaming cache access
+
+2. Softmax kernel:
+   - Online algorithm maintains running max and sum
+   - Avoids numerical overflow by computing exp(x - max)
+   - Warp-level reductions for max and sum
+   - Processes rows in reverse order for better cache locality
+
+3. Softmax backward:
+   - Processes multiple rows per block (T_per_block=4)
+   - Block-level reductions to compute local sum
+   - Reverse order to maximize cache hits
+
+MEMORY LAYOUTS:
+- QKV combined: (B, T, 3, NH, HS) - interleaved in memory
+- Q, K, V separated: (B, NH, T, HS) - heads are batched dimension
+- Attention scores: (B, NH, T, T) - lower triangular used (causal)
+- Output: (B, T, C) where C = NH * HS
+
+OPTIMIZATIONS:
+1. Batched cuBLASLt for efficient GEMM operations
+2. Online softmax algorithm (single pass, numerically stable)
+3. Backward iteration order for cache locality
+4. In-place softmax gradient (saves memory bandwidth)
+5. Streaming cache hints to avoid pollution
+
+PERFORMANCE CONSIDERATIONS:
+- Attention has O(T^2) complexity in sequence length T
+- Memory usage: O(B * NH * T^2) for attention scores
+- Causal masking reduces computation by ~50%
+- cuBLASLt provides optimized tensor core usage on modern GPUs
+- For very long sequences, consider Flash Attention instead
+
+REFERENCES:
+- Attention Is All You Need (Vaswani et al., 2017) - Original transformer
+  https://arxiv.org/abs/1706.03762
+- Online normalizer calculation for softmax (algorithm)
+- Flash Attention (Dao et al., 2022) - More efficient attention for long sequences
+  https://arxiv.org/abs/2205.14135
 */
 #include <assert.h>
 // llmc internal imports

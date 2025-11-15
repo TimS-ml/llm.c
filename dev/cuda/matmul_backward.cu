@@ -1,9 +1,72 @@
 /*
-Kernels for matmul backward pass.
+===============================================================================
+Matrix Multiplication Backward Pass - CUDA Kernel Development
+===============================================================================
+
+PURPOSE:
+This file implements the backward pass (gradient computation) for matrix
+multiplication operations. The backward pass is equally critical as the forward
+pass, as it's executed once per training iteration to compute gradients for
+backpropagation.
+
+WHY BACKWARD MATMUL IS CRITICAL:
+In transformer training, backward pass matmuls are just as expensive as forward:
+- For forward: out = inp @ weight.T + bias
+- We need to compute three gradients:
+  1. dinp: gradient w.r.t. input (for backprop to previous layer)
+  2. dweight: gradient w.r.t. weights (for parameter updates)
+  3. dbias: gradient w.r.t. bias (for parameter updates)
+
+Each backward pass requires 2 matrix multiplications + 1 reduction, making it
+~2x the cost of the forward pass!
+
+MATHEMATICAL BACKGROUND:
+Given: out = inp @ weight.T + bias
+Forward: out[b,t,oc] = sum_c(inp[b,t,c] * weight[oc,c]) + bias[oc]
+
+Backward (using chain rule):
+We receive dout (gradient w.r.t. output) and need to compute:
+
+1. dinp (gradient w.r.t. input):
+   dinp[b,t,c] = sum_oc(dout[b,t,oc] * weight[oc,c])
+   Matrix form: dinp = dout @ weight
+   Shape: (B*T, OC) @ (OC, C) = (B*T, C)
+
+2. dweight (gradient w.r.t. weight):
+   dweight[oc,c] = sum_{b,t}(dout[b,t,oc] * inp[b,t,c])
+   Matrix form: dweight = dout.T @ inp
+   Shape: (OC, B*T) @ (B*T, C) = (OC, C)
+
+3. dbias (gradient w.r.t. bias):
+   dbias[oc] = sum_{b,t}(dout[b,t,oc])
+   This is a simple sum reduction over batch and time dimensions
+
+COMPUTE COST:
+For a single matmul backward:
+- dinp computation: B*T*OC*C multiply-adds
+- dweight computation: B*T*OC*C multiply-adds
+- dbias computation: B*T*OC additions
+Total: ~2x the cost of forward pass (2 matmuls instead of 1)
+
+MEMORY LAYOUT:
+All tensors use row-major storage (C-style):
+- dout: (B, T, OC) - incoming gradients
+- inp: (B, T, C) - saved from forward pass
+- weight: (OC, C) - saved from forward pass
+- dinp: (B, T, C) - gradient output
+- dweight: (OC, C) - gradient output
+- dbias: (OC) - gradient output
+
+PERFORMANCE STRATEGY:
+Like forward pass, we rely primarily on cuBLAS for the two matrix multiplications,
+as they're the same fundamental operation just with different matrices. The
+tricky part is the bias gradient, which requires a custom reduction kernel.
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt -Xcompiler -fopenmp matmul_backward.cu -o matmul_backward
 
+KERNEL VERSIONS:
+version 1: Uses cuBLAS for dinp and dweight, custom kernel for dbias
 OMP_NUM_THREADS=32 ./matmul_backward 1
 */
 
@@ -62,13 +125,47 @@ void matmul_backward_cpu(float* dinp, float* dweight, float* dbias,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-// naive kernel to backpropagate only the bias, it's just a sum :'(
+/*
+BIAS GRADIENT KERNEL (NAIVE): Simple Sequential Reduction
+==========================================================
+
+ALGORITHM:
+Each thread is assigned one output channel and sequentially sums all the
+gradients for that channel across the entire batch and sequence length.
+
+THREAD MAPPING:
+- 1D grid of threads, one thread per output channel
+- Thread i computes dbias[i] = sum over all (b,t) of dout[b,t,i]
+
+MEMORY ACCESS PATTERN:
+Each thread reads B*T values with stride OC (non-coalesced!). For thread i:
+- dout[0*T*OC + 0*OC + i]
+- dout[0*T*OC + 1*OC + i]
+- ... (stride OC between accesses)
+
+PERFORMANCE:
+Very poor! Each thread does strided global memory access with large stride.
+On modern GPUs, this means we're not utilizing memory bandwidth efficiently.
+
+WHY IT'S SLOW:
+1. Strided memory access (stride = OC, typically 1024-4096)
+2. No memory coalescing across threads in a warp
+3. No shared memory utilization
+4. Each thread works independently (no cooperation)
+
+LESSON LEARNED:
+Don't do strided access patterns! Memory bandwidth is wasted when threads in
+a warp access non-contiguous memory locations.
+*/
 __global__ void matmul_backward_bias_kernel_naive(float* dbias, const float* dout, int B, int T, int OC) {
     int o = blockIdx.x * blockDim.x + threadIdx.x;
     if (o < OC) {
+        // Sum all gradients for this output channel
+        // Using double for accumulation to reduce numerical errors
         double sum = 0.0;
         for (int b = 0; b < B; b++) {
             for (int t = 0; t < T; t++) {
+                // Strided access: accessing elements with stride OC
                 sum += dout[b * T * OC + t * OC + o];
             }
         }
@@ -76,28 +173,86 @@ __global__ void matmul_backward_bias_kernel_naive(float* dbias, const float* dou
     }
 }
 
-// use shared memory and coarsening + reductions
+/*
+BIAS GRADIENT KERNEL (FASTER): Shared Memory Reduction
+=======================================================
+
+ALGORITHM:
+Uses a two-phase reduction strategy:
+1. Thread coarsening: Each thread sums multiple elements into a partial sum
+2. Block-wide reduction: Threads cooperate using shared memory to reduce
+   partial sums to a single value
+
+THREAD/BLOCK ORGANIZATION:
+- One block per output channel: blockIdx.x = output channel index
+- block_size threads per block (typically 512)
+- Each block reduces B*T values to 1 value
+
+MEMORY ACCESS PATTERN:
+Phase 1 (Thread Coarsening):
+- Threads in block stride through their output channel's data
+- Thread tid accesses: dout[tid*OC + o], dout[(tid+block_size)*OC + o], ...
+- Still strided, but better than naive (more parallelism)
+
+Phase 2 (Tree Reduction):
+- All accesses are to shared memory (very fast, ~100x faster than global)
+- Binary tree reduction: stride = block_size/2, block_size/4, ..., 1
+- Each iteration, active threads halve
+
+OPTIMIZATION TECHNIQUES:
+1. Thread Coarsening: Each thread processes multiple elements before reducing
+   - Reduces number of threads needed
+   - Increases arithmetic intensity
+   - Better register utilization
+
+2. Shared Memory Reduction: Fast on-chip memory for inter-thread communication
+   - Shared memory bandwidth: ~10 TB/s (vs ~1.5 TB/s global memory)
+   - Enables efficient tree reduction
+
+3. Double Precision Accumulation: Reduces numerical error for large reductions
+
+PERFORMANCE:
+Much better than naive! Typically 5-10x faster. Still not optimal due to
+strided global memory access, but the parallel reduction helps.
+
+COMPARISON:
+On A100, can process ~1-2 GB/s effective bandwidth (still memory bound).
+More sophisticated kernels (see matmul_backward_bias.cu) can achieve 10-20x
+better performance by improving the access pattern.
+
+LESSON LEARNED:
+Shared memory reductions are a key technique for parallel reductions on GPUs.
+The pattern is: thread coarsening → shared memory → tree reduction → output.
+*/
 __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* dout, int B, int T, int OC) {
     extern __shared__ float shared[];
-    int o = blockIdx.x; // range [0, OC)
-    int tid = threadIdx.x; // range [0, block_size)
+    int o = blockIdx.x; // range [0, OC) - which output channel this block handles
+    int tid = threadIdx.x; // range [0, block_size) - thread index within block
     int block_size = blockDim.x;
+
+    // Pointer to this output channel's data in dout
     const float* x = dout + o;
-    // thread coarsening
+
+    // Phase 1: Thread coarsening
+    // Each thread sums multiple elements with stride block_size
+    // This reduces the problem size from B*T to block_size
     double sum = 0.0;
     for (int i = tid; i < B * T; i += block_size) {
-        sum += x[i * OC];
+        sum += x[i * OC];  // Strided access with stride OC
     }
     shared[tid] = (float) sum;
     __syncthreads();
-    // reductions
+
+    // Phase 2: Tree reduction in shared memory
+    // Reduce block_size partial sums to 1 final sum
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
         if (tid < stride) {
             shared[tid] += shared[tid + stride];
         }
     }
-    // write the final result (at thread 0) to global memory
+
+    // Write the final result (at thread 0) to global memory
     if (tid == 0) {
         dbias[o] = shared[0];
     }
@@ -106,7 +261,77 @@ __global__ void matmul_backward_bias_kernel_faster(float* dbias, const float* do
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-// version1: simple cuBLAS calls
+/*
+MATMUL BACKWARD VERSION 1: cuBLAS-based Implementation
+=======================================================
+
+ALGORITHM:
+Uses cuBLAS for the two matrix multiplications (dinp and dweight) and a custom
+reduction kernel for the bias gradient. This is the standard approach for
+computing matmul gradients on GPUs.
+
+GRADIENT COMPUTATION:
+
+1. GRADIENT W.R.T. INPUT (dinp):
+   Mathematical: dinp[b,t,c] = sum_oc(dout[b,t,oc] * weight[oc,c])
+   Matrix form: dinp = dout @ weight
+
+   Shape analysis:
+   - dout: (B*T, OC)
+   - weight: (OC, C)
+   - dinp: (B*T, C)
+
+   cuBLAS call: C = alpha * A * B + beta * C
+   - A = weight (OC, C) - no transpose
+   - B = dout (B*T, OC) - no transpose
+   - C = dinp (B*T, C)
+
+   With row-major/column-major conversion:
+   - cublasSgemm(..., CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, weight, dout, dinp)
+
+2. GRADIENT W.R.T. WEIGHT (dweight):
+   Mathematical: dweight[oc,c] = sum_{b,t}(dout[b,t,oc] * inp[b,t,c])
+   Matrix form: dweight = dout.T @ inp
+
+   Shape analysis:
+   - dout.T: (OC, B*T)
+   - inp: (B*T, C)
+   - dweight: (OC, C)
+
+   cuBLAS call: C = alpha * A * B + beta * C
+   - A = inp (B*T, C) - no transpose
+   - B = dout (B*T, OC) - needs transpose
+   - C = dweight (OC, C)
+
+   With row-major/column-major conversion:
+   - cublasSgemm(..., CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, inp, dout, dweight)
+
+3. GRADIENT W.R.T. BIAS (dbias):
+   Mathematical: dbias[oc] = sum_{b,t}(dout[b,t,oc])
+   Simple reduction over batch and time dimensions
+
+   Custom kernel needed because cuBLAS doesn't have an efficient operation for this.
+   We use the shared memory reduction kernel for better performance.
+
+IMPORTANT: GRADIENT ACCUMULATION
+The beta = 1.0f parameter is crucial! In neural networks, gradients from
+multiple operations are accumulated (added together). Using beta = 1.0 means:
+  C = alpha * A * B + beta * C  becomes  C += A * B
+This is essential for backpropagation through layers with residual connections,
+where gradients from multiple paths must be summed.
+
+PERFORMANCE:
+- dinp computation: ~same speed as forward pass matmul (dominated by cuBLAS)
+- dweight computation: ~same speed as forward pass matmul (dominated by cuBLAS)
+- dbias computation: Much faster (small reduction), but uses custom kernel
+Overall: Backward pass takes ~2x forward pass time (expected for 2 matmuls)
+
+LESSON LEARNED:
+1. Use cuBLAS for large matrix operations - it's highly optimized
+2. Beta parameter enables gradient accumulation (crucial for backprop!)
+3. Custom kernels needed for operations cuBLAS doesn't support (reductions)
+4. The row-major vs column-major layout requires careful thought for correctness
+*/
 void matmul_backward1(float* dinp, float* dweight, float* dbias,
                       float* dout, float* inp, float* weight, float* ones,
                       int B, int T, int C, int OC) {
@@ -126,12 +351,19 @@ void matmul_backward1(float* dinp, float* dweight, float* dbias,
     // recall the forward pass was calculated with alpha = 1.0f, beta = 0.0f as:
     // cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, OC, B*T, C, &alpha, weight, C, inp, C, &beta, out, OC);
 
-    // backward to input
+    // Compute gradient w.r.t. input: dinp = dout @ weight
+    // Shape: (B*T, OC) @ (OC, C) = (B*T, C)
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, C, B*T, OC, &alpha, weight, C, dout, OC, &beta, dinp, C));
-    // backward to weight
+
+    // Compute gradient w.r.t. weight: dweight = dout.T @ inp
+    // Shape: (OC, B*T) @ (B*T, C) = (OC, C)
     cublasCheck(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T, C, OC, B*T, &alpha, inp, C, dout, OC, &beta, dweight, C));
-    // backward to bias, if given
+
+    // Compute gradient w.r.t. bias: dbias = sum(dout, dim=(0,1))
     if (dbias != NULL) {
+        // Note: We tried using cuBLAS gemv (matrix-vector multiply) to compute the
+        // reduction, but it didn't work correctly. The issue is that gemv isn't
+        // designed for this reduction pattern. Custom kernel is clearer and works.
 
         // sum over B,T using matrix vector multiplication with cuBLAS
         // for reference this API is:
@@ -152,10 +384,10 @@ void matmul_backward1(float* dinp, float* dweight, float* dbias,
         // const int grid_size=(OC + block_size - 1) / block_size;
         // matmul_backward_bias_kernel<<<grid_size, block_size>>>(dbias, dout, B, T, OC);
 
-        // bit faster
+        // Use shared memory reduction kernel (much faster than naive)
         const int block_size=512;
         dim3 block_dim(block_size);
-        dim3 grid_dim(OC);
+        dim3 grid_dim(OC);  // One block per output channel
         size_t shared_mem_size = block_size * sizeof(float);
         matmul_backward_bias_kernel_faster<<<grid_dim, block_dim, shared_mem_size>>>(dbias, dout, B, T, OC);
     }

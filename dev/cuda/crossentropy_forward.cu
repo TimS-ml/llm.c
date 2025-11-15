@@ -1,5 +1,47 @@
 /*
-Kernels for crossentropy forward pass.
+Kernels for cross-entropy loss forward pass.
+
+OPERATION OVERVIEW:
+Cross-entropy is the loss function used to train language models. It measures the
+difference between predicted probabilities and actual targets.
+
+For each position (b,t):
+  loss[b,t] = -log(probs[b,t,target[b,t]])
+
+Where:
+- probs: Probability distribution over vocabulary (from softmax)
+- target: The correct token ID at this position
+- loss: How "surprised" the model is by the correct answer
+
+Example: If model predicts 90% probability for correct token, loss = -log(0.9) = 0.105
+         If model predicts 10% probability for correct token, loss = -log(0.1) = 2.303
+         Lower loss = better predictions
+
+ROLE IN TRANSFORMER:
+Cross-entropy is the training objective for language models. During training:
+1. Model produces logits (raw predictions) for next token
+2. Softmax converts logits to probabilities
+3. Cross-entropy computes loss by comparing predictions to ground truth
+4. Backpropagation uses this loss to update model weights
+
+The model learns by minimizing cross-entropy - it gets better at predicting the
+actual next tokens in the training data.
+
+WHY SIMPLE IMPLEMENTATION:
+Unlike softmax, cross-entropy is embarrassingly parallel:
+- Each position (b,t) can be processed independently
+- Just lookup probs[target] and compute -log()
+- No reductions or thread cooperation needed
+
+The single kernel version is already optimal because:
+- Memory access: One read (probs[target]) and one write (loss)
+- Compute: Single log operation
+- Fully parallel across all B*T positions
+
+More complex optimizations (like vectorization) don't help much because:
+1. Irregular memory access (depends on random target indices)
+2. Each position only needs one probability value (not a contiguous block)
+3. Simple operation is already compute-bound on log()
 
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt crossentropy_forward.cu -o crossentropy_forward
@@ -35,6 +77,45 @@ void crossentropy_forward_cpu(float* losses,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
+// KERNEL 1: Element-wise cross-entropy loss computation
+//
+// ALGORITHM:
+// - Each thread handles one position (b,t)
+// - Looks up the target token ID for that position
+// - Reads the predicted probability for that token
+// - Computes loss = -log(probability)
+//
+// MATHEMATICAL NOTE:
+// We use -log instead of log because:
+// - Probabilities are in [0, 1]
+// - log(x) for x in (0,1] gives negative values
+// - Negating makes loss positive (easier to interpret)
+// - Perfect prediction (prob=1.0) gives loss=0
+// - Bad prediction (prob→0) gives loss→∞
+//
+// PARALLELIZATION:
+// - Launch B*T threads (one per sequence position)
+// - Each thread works completely independently
+// - No thread communication needed
+//
+// MEMORY ACCESS PATTERN:
+// - Random access to probs (depends on target token IDs)
+// - Sequential access to targets and losses
+// - No memory reuse between threads (each position needs different token)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Good (B*T threads, typically thousands)
+// - Memory bandwidth: Moderate (random access to probs limits coalescing)
+// - Compute: Light (single log operation per thread)
+// - Best for: All cases (operation is too simple to optimize further)
+//
+// WHY NO OPTIMIZED VERSIONS:
+// Unlike other kernels, cross-entropy doesn't benefit from:
+// - Vectorization: Target indices are random, can't load contiguous blocks
+// - Shared memory: No data reuse between threads
+// - Reductions: Each output is independent
+// This simple version is already near-optimal.
+//
 __global__ void crossentropy_forward_kernel1(float* losses,
                             const float* probs, const int* targets,
                             int B, int T, int V) {

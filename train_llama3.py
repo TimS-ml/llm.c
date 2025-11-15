@@ -1,19 +1,60 @@
 """
-Reference code for LLaMA-3.1 training and inference.
-Will save the model weights into files, to be read from C as initialization.
+LLaMA 3.1 Training and Inference Reference Implementation
 
-This code differs from GPT-2 very slightly, there are three main differences:
-1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
-2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
-3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
+This module provides a complete PyTorch implementation of the LLaMA 3.1 language model
+from Meta, including training, inference, and model export functionality. It serves as
+a reference implementation for the llm.c project.
+
+Key Architectural Differences from GPT-2:
+    1. RoPE (Rotary Position Embedding): Instead of learned position embeddings,
+       LLaMA uses rotary position encodings that encode position information by
+       rotating query and key vectors. This allows better length generalization.
+
+    2. GQA (Grouped Query Attention): Reduces memory bandwidth by sharing key/value
+       heads across multiple query heads. LLaMA 3.1 8B uses 8 KV heads for 32 query heads,
+       a 4x reduction in KV cache size.
+
+    3. SwiGLU Activation: Replaces GELU with SwiGLU (Swish-Gated Linear Unit) in the
+       feed-forward network. This uses two linear projections with element-wise
+       multiplication: SwiGLU(x) = Swish(W1(x)) * W2(x)
+
+    4. RMSNorm: Uses Root Mean Square Layer Normalization instead of LayerNorm,
+       which is simpler and often performs better.
+
+    5. No Biases: All linear layers use bias=False to reduce parameters.
+
+Model Sizes:
+    - LLaMA 3.1 8B: 32 layers, 32 heads, 8 KV heads, 4096 dim (~8B parameters)
 
 References:
-# 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
-# 2) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
-# 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
+    1. LLaMA 3.1 Tokenizer:
+       https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
+    2. LLaMA 3.1 Model:
+       https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
+    3. LLaMA 3 Generation:
+       https://github.com/meta-llama/llama3/blob/main/llama/generation.py
 
-Example launches to only benchmark the speed of bfloat16 compiled GPU training:
-TODO: add the actual commands
+Example Usage:
+    # Load pretrained model from HuggingFace:
+    python train_llama3.py --use_hf=1 --model=meta-llama/Meta-Llama-3.1-8B \\
+        --num_iterations=100 --batch_size=4 --sequence_length=512
+
+    # Train with distributed setup:
+    torchrun --standalone --nproc_per_node=4 train_llama3.py --use_hf=1 \\
+        --input_bin=data/train.bin --batch_size=2 --dtype=bfloat16
+
+    # Export model weights to binary format:
+    python train_llama3.py --write_tensors=1 --output_dir=checkpoints
+
+Command-Line Arguments:
+    --use_hf: Use HuggingFace model (1) or Meta's checkpoint (0)
+    --model: Model identifier (meta-llama/Meta-Llama-3.1-8B)
+    --input_bin: Path to training data
+    --batch_size: Batch size per GPU
+    --sequence_length: Sequence length (max 8192 for LLaMA 3.1)
+    --dtype: Data type (float32, float16, bfloat16)
+    --compile: Enable torch.compile
+    --write_tensors: Export weights to binary format
 """
 
 import argparse
@@ -55,9 +96,30 @@ from tiktoken.load import load_tiktoken_bpe
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the LLaMA 3.x model
 
-# Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    """
+    Repeat key/value tensors for Grouped Query Attention (GQA).
+
+    In GQA, we have fewer key/value heads than query heads to reduce memory usage.
+    This function broadcasts each KV head to match multiple query heads. For example,
+    if n_kv_heads=8 and n_heads=32, each KV head is repeated 4 times (n_rep=4).
+
+    This is memory-efficient alternative to Multi-Head Attention while maintaining
+    model quality. LLaMA 3.1 8B uses 8 KV heads vs 32 query heads.
+
+    Args:
+        x (torch.Tensor): Key or value tensor, shape (bs, slen, n_kv_heads, head_dim)
+        n_rep (int): Number of times to repeat each KV head (n_heads // n_kv_heads)
+
+    Returns:
+        torch.Tensor: Repeated tensor, shape (bs, slen, n_kv_heads * n_rep, head_dim)
+
+    Example:
+        >>> kv = torch.randn(2, 512, 8, 128)  # 8 KV heads
+        >>> kv_repeated = repeat_kv(kv, n_rep=4)  # Repeat for 32 query heads
+        >>> kv_repeated.shape
+        torch.Size([2, 512, 32, 128])
+    """
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -106,22 +168,87 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply Rotary Position Embeddings (RoPE) to query and key tensors.
+
+    RoPE encodes position information by rotating the embedding vectors in
+    complex space. Unlike learned position embeddings, RoPE allows the model
+    to generalize to longer sequences than seen during training.
+
+    The rotation is applied via complex multiplication:
+        output = input * exp(i * position * freq)
+
+    Args:
+        xq (torch.Tensor): Query tensor, shape (..., head_dim)
+        xk (torch.Tensor): Key tensor, shape (..., head_dim)
+        freqs_cis (torch.Tensor): Precomputed rotation frequencies (complex),
+            shape (seq_len, head_dim // 2)
+
+    Returns:
+        tuple: (rotated_query, rotated_key) with same shapes as inputs
+
+    Implementation:
+        - Converts real tensors to complex by pairing consecutive dims
+        - Applies rotation via complex multiplication
+        - Converts back to real representation
+    """
+    # Reshape last dim to pairs of values and convert to complex
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+
+    # Reshape freqs_cis to broadcast correctly
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+
+    # Apply rotation in complex space, then convert back to real
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def precompute_freqs_cis(
     dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
 ):
+    """
+    Precompute rotation frequencies for RoPE (Rotary Position Embeddings).
+
+    Creates a table of rotation frequencies that will be applied to query/key
+    embeddings. Each position gets rotated by a different angle that depends
+    on the position index and frequency.
+
+    Args:
+        dim (int): Dimension of the head (must be even)
+        end (int): Maximum sequence length to precompute for
+        theta (float): Base for computing frequencies. Higher values give
+            slower rotation. LLaMA 3 uses 500000. Default: 10000
+        use_scaled (bool): Apply frequency scaling for extended context.
+            LLaMA 3.1 uses this to extend from 8K to longer contexts.
+
+    Returns:
+        torch.Tensor: Complex tensor of shape (end, dim // 2) containing
+            rotation frequencies for each position
+
+    Note:
+        The frequencies are computed as: 1 / (theta^(2i/dim)) for i in [0, dim/2)
+        This creates a geometric progression of rotation speeds.
+    """
+    # Compute base frequencies: 1 / (theta^(2i/d)) for i=0,1,...,dim/2
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    # Position indices from 0 to end-1
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+
+    # Apply frequency scaling if needed (for extended context)
     if use_scaled:
         freqs = apply_scaling(freqs)
+
+    # Outer product: (end,) x (dim/2,) -> (end, dim/2)
+    # Each row is the frequencies for one position
     freqs = torch.outer(t, freqs)
+
+    # Convert to complex exponentials: exp(i * freqs)
+    # polar(r, theta) returns r * exp(i * theta)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+
     return freqs_cis
 
 # -----------------------------------------------------------------------------
@@ -131,15 +258,44 @@ def precompute_freqs_cis(
 # (https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py)
 # we could also use nn.RMSNorm, it has slightly different numeric properties, but equivalent
 class RMSNorm(torch.nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+
+    RMSNorm is a simpler alternative to LayerNorm that only normalizes by the
+    root mean square (RMS) without centering (subtracting mean). This reduces
+    computation and often performs as well or better than LayerNorm.
+
+    The normalization is computed as:
+        RMSNorm(x) = x / RMS(x) * weight
+        where RMS(x) = sqrt(mean(x^2) + eps)
+
+    Args:
+        dim (int): Dimension of the input (typically embedding dimension)
+        eps (float): Small constant for numerical stability. Default: 1e-6
+
+    Reference:
+        "Root Mean Square Layer Normalization" by Zhang & Sennrich (2019)
+        https://arxiv.org/abs/1910.07467
+    """
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
+        """Compute RMS normalization: x / sqrt(mean(x^2) + eps)"""
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        """
+        Apply RMS normalization with learnable scale.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape (..., dim)
+
+        Returns:
+            torch.Tensor: Normalized and scaled tensor, same shape as input
+        """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -203,26 +359,73 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
+    """
+    Feed-Forward Network with SwiGLU activation for LLaMA.
+
+    This differs from GPT-2's MLP in two ways:
+    1. Uses SwiGLU activation instead of GELU:
+       SwiGLU(x) = Swish(W2(x)) * W1(x) = SiLU(W2(x)) * W1(x)
+
+    2. Uses a different hidden dimension calculation (approximately 8/3 * n_embd)
+       instead of 4 * n_embd, and rounds to a multiple for efficiency.
+
+    SwiGLU has been shown to improve quality over GELU in large language models.
+    The gating mechanism (multiplication) allows the network to control information
+    flow more flexibly.
+
+    Attributes:
+        c_fc (nn.Linear): First gate projection (W1)
+        c_fc2 (nn.Linear): Second gate projection (W2, with SiLU activation)
+        c_proj (nn.Linear): Output projection
+
+    Architecture:
+        SwiGLU(x) = (SiLU(c_fc2(x)) * c_fc(x)) @ c_proj
+    """
 
     def __init__(self, config):
+        """
+        Initialize SwiGLU MLP.
+
+        Args:
+            config: Model configuration with n_embd, ffn_dim_multiplier, multiple_of
+        """
         super().__init__()
+        # Calculate hidden dimension: start with 8/3 of embedding dim
         hidden_dim = 4 * config.n_embd
         hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
+
+        # Apply custom multiplier if specified
         if config.ffn_dim_multiplier is not None:
             hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
+
+        # Round up to nearest multiple for efficient computation
         hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
-        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+
+        # Two projections for the gating mechanism (no biases in LLaMA)
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)   # W1
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)  # W2
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False) # Output
 
     def forward(self, x):
-        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
-        x1 = self.c_fc(x)
-        x2 = self.c_fc2(x)
-        x2 = F.silu(x2)
-        x = x1 * x2
-        x = self.c_proj(x)
+        """
+        Apply SwiGLU transformation.
+
+        Args:
+            x (torch.Tensor): Input tensor, shape (B, T, C)
+
+        Returns:
+            torch.Tensor: Output tensor, shape (B, T, C)
+
+        Computation:
+            output = (SiLU(W2(x)) * W1(x)) @ W_out
+        """
+        # SwiGLU: self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))
+        # This is the key difference from GPT-2's GELU-based MLP
+        x1 = self.c_fc(x)        # First projection (W1)
+        x2 = self.c_fc2(x)       # Second projection (W2)
+        x2 = F.silu(x2)          # Apply SiLU (Swish) activation
+        x = x1 * x2              # Element-wise gating
+        x = self.c_proj(x)       # Output projection
         return x
 
 class Block(nn.Module):

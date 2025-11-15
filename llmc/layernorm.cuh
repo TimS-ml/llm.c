@@ -1,12 +1,149 @@
 /*
-LayerNorm CUDA kernel, and also Residual, because sometimes they are fused
+==============================================================================
+Layer Normalization and Residual Connections
+==============================================================================
 
-Note in llm.c we try to be clever in the backward pass to conserve memory.
-All parameters use a += in the backward pass, so we can do gradient accumulation.
-But all activations have = instead of += because these are faster (just read, no write).
-This is okay for all activations except for those in the residual stream, where the
-gradients have to add. We make sure that we do a += as necessary.
-E.g., the layernorms are connected to the residuals so we += in layernorm backward.
+PURPOSE:
+Implements Layer Normalization (LayerNorm) and residual connections, two
+critical components of transformer architectures. Also includes fused
+operations that combine residual addition with normalization for efficiency.
+
+MATHEMATICAL OPERATION - LayerNorm:
+For input x of shape (N, C) where N = batch*sequence_length:
+
+1. Compute statistics across channels (per-example):
+   mean[n] = (1/C) * sum_c(x[n, c])
+   var[n]  = (1/C) * sum_c((x[n, c] - mean[n])^2)
+
+2. Normalize:
+   x_norm[n, c] = (x[n, c] - mean[n]) / sqrt(var[n] + eps)
+
+3. Scale and shift with learned parameters:
+   out[n, c] = x_norm[n, c] * weight[c] + bias[c]
+
+LayerNorm normalizes across the feature dimension (C) for each example
+independently, unlike BatchNorm which normalizes across the batch dimension.
+This makes it well-suited for sequence models where batch sizes may vary.
+
+MATHEMATICAL OPERATION - Residual:
+  out = inp1 + inp2
+
+Residual connections allow gradients to flow directly through the network,
+enabling training of very deep models (100+ layers).
+
+FORWARD PASS IMPLEMENTATIONS:
+
+1. layernorm_forward_kernel3 (baseline):
+   - Each warp processes one example (N)
+   - Two passes over the data:
+     Pass 1: Compute mean via warp reduction
+     Pass 2: Compute variance via warp reduction
+   - Final pass: Normalize and apply weight/bias
+   - Streaming cache hints to avoid polluting L1
+
+2. layernorm_forward_kernel6 (optimized):
+   - Preloads weight/bias into shared memory
+   - Caches input data in shared memory between passes
+   - Single shared memory load per element
+   - Falls back to kernel3 if shared memory allocation fails
+   - Better performance on larger models where C fits in shared memory
+
+3. fused_residual_forward_kernel5:
+   - Combines residual addition + layernorm in one kernel
+   - Computes: out = layernorm(inp1 + inp2)
+   - Saves memory bandwidth by avoiding intermediate materialization
+   - Stores residual for backward pass
+
+4. residual_forward_kernel:
+   - Standalone residual addition
+   - Vectorized using x128 (processes 8 BF16 values per thread)
+   - Used when fusion is not beneficial
+
+BACKWARD PASS ALGORITHM:
+
+LayerNorm backward computes gradients w.r.t. input, weight, and bias:
+
+Given dout (gradient from upstream), compute:
+
+1. Gradient w.r.t. normalized values:
+   dnorm[n, c] = dout[n, c] * weight[c]
+
+2. Statistics needed for input gradient:
+   dnorm_mean = (1/C) * sum_c(dnorm[n, c])
+   dnorm_norm_mean = (1/C) * sum_c(dnorm[n, c] * x_norm[n, c])
+
+3. Gradient w.r.t. input (using chain rule through variance and mean):
+   dinp[n, c] = (1/rstd[n]) * (dnorm[n, c] - dnorm_mean - x_norm[n, c] * dnorm_norm_mean)
+
+   where rstd[n] = 1 / sqrt(var[n] + eps)
+
+4. Gradient w.r.t. parameters:
+   dweight[c] = sum_n(dout[n, c] * x_norm[n, c])
+   dbias[c] = sum_n(dout[n, c])
+
+CUDA KERNEL IMPLEMENTATION - layernorm_backward_kernel10:
+
+This is a highly optimized kernel with several advanced features:
+
+1. Multi-level reduction strategy:
+   - Each warp processes multiple examples (stride through N)
+   - Within each block, warps accumulate gradients independently
+   - Warp 0 becomes the master, accumulating results from other warps
+   - Final reduction across blocks uses global memory + atomic flag
+
+2. Shared memory layout:
+   - dbias_shared: [rounded_C] elements
+   - dweight_shared: [rounded_C] elements
+   - Temporary storage for inter-warp communication
+   - Rounded to 32*x128::size for alignment
+
+3. Two-stage accumulation:
+   - Stage 1: Each block accumulates its partial sums to shared memory
+   - Stage 2: Last block to finish performs final reduction
+   - Uses atomic flag to detect last block (deterministic)
+
+4. Precision handling:
+   - Accumulates in FP32 (f128) for numerical accuracy
+   - Converts to floatX (BF16/FP8) only for final write
+   - Stochastic rounding on parameters
+
+5. Cache optimizations:
+   - store128cg on dinp: Bypass L1, keep in L2 for next kernel
+   - Minimizes cache thrashing
+
+MEMORY ACCESS PATTERNS:
+- LayerNorm forward: Sequential reads/writes, good coalescing
+- LayerNorm backward: More complex due to reductions
+  * Input gradient: Scattered writes, but coalesced within warps
+  * Parameter gradients: Requires reduction across all examples
+- Residual: Fully coalesced, memory-bandwidth bound
+
+GRADIENT ACCUMULATION STRATEGY:
+Note: In llm.c we use different update strategies for memory efficiency:
+- Parameters: Always use += (gradient accumulation)
+- Most activations: Use = (faster, no read-modify-write)
+- Residual stream: Use += (multiple gradient paths converge)
+
+The layernorm is connected to residuals, so dinp uses += in backward pass.
+
+OPTIMIZATIONS:
+1. Shared memory for weight/bias (reduces global memory traffic)
+2. Warp-level reductions (faster than block-level)
+3. Vectorized loads/stores (x128 for data, f128 for accumulators)
+4. Fused residual+layernorm (saves memory bandwidth)
+5. Cache bypass hints for streaming data
+6. Deterministic reductions without atomics
+
+PERFORMANCE CONSIDERATIONS:
+- Forward pass: Memory-bandwidth bound, ~2-3x read bandwidth of input size
+- Backward pass: Compute-bound for parameter gradients (requires reduction)
+- Shared memory size limits maximum C (typically 4096 for BF16)
+- Block size = 512, 2 blocks/SM for good occupancy
+
+REFERENCES:
+- Layer Normalization (Ba et al., 2016): https://arxiv.org/abs/1607.06450
+- Deep Residual Learning (He et al., 2015): https://arxiv.org/abs/1512.03385
+- NVIDIA Developer Blog on efficient reductions
 */
 
 #include <assert.h>

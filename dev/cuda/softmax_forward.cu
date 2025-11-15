@@ -1,6 +1,59 @@
 /*
 Kernels for softmax forward pass.
 
+OPERATION OVERVIEW:
+Softmax converts a vector of real numbers into a probability distribution. For each row:
+1. Find the maximum value (for numerical stability)
+2. Compute exp(x - max) for each element
+3. Sum all the exponentials
+4. Divide each element by the sum
+
+Mathematically: softmax(x_i) = exp(x_i - max(x)) / Σ exp(x_j - max(x))
+
+The subtraction of max(x) is crucial - without it, exp(x) can overflow for large values,
+causing NaN or Inf. This is a numerically stable formulation.
+
+ROLE IN TRANSFORMER:
+Softmax appears in two critical places:
+1. Attention mechanism: Converts attention scores to attention weights (probabilities)
+   Each query attends to all keys with weights that sum to 1.0
+2. Output layer: Converts logits to token probabilities for next-token prediction
+
+In attention, softmax ensures the model can "focus" - it amplifies important connections
+and suppresses irrelevant ones while maintaining a valid probability distribution.
+
+WHY MULTIPLE KERNEL VERSIONS:
+Softmax is a REDUCTION operation - each output row depends on ALL input elements in that row.
+This makes it fundamentally different from element-wise ops like GELU. Threads must cooperate
+to compute max and sum across the row, leading to various optimization strategies:
+
+- Version 1: Naive (each thread = one row, loops to find max & sum)
+             Simple but underutilizes GPU
+
+- Version 2: Block-based with shared memory reductions
+             Threads cooperate using tree reduction in shared memory
+             Better parallelism for large C
+
+- Version 3: Warp-level reductions (block_size must be 32)
+             Uses fast warp shuffle instructions instead of shared memory
+             Lower latency for small C
+
+- Version 4: Hybrid warp + shared memory reductions (any block_size % 32 == 0)
+             Combines warp shuffles (intra-warp) with shared memory (inter-warp)
+             Most versatile and efficient for typical cases
+
+- Version 5-6: "Online softmax" algorithm
+             Single-pass algorithm that computes max and sum simultaneously
+             Reduces memory reads from 3 passes to 2 passes
+             Based on paper "Online normalizer calculation for softmax"
+
+- Version 7-8: Optimized for very large C
+             Uses loop unrolling and careful register allocation
+             Best when vocabulary size is very large (e.g., 50K tokens)
+
+The complexity here shows that reduction operations require much more sophisticated
+optimization than element-wise operations.
+
 Compile example:
 nvcc -O3 --use_fast_math -lcublas -lcublasLt softmax_forward.cu -o softmax_forward
 
@@ -96,6 +149,40 @@ void softmax_forward_online_cpu(float* out, const float* inp, int N, int C) {
 // ----------------------------------------------------------------------------
 // GPU kernels
 
+// KERNEL 1: Naive row-wise softmax
+//
+// ALGORITHM:
+// - Each thread handles one complete row (N dimension)
+// - Three sequential loops per row:
+//   1. Find max value (for numerical stability)
+//   2. Compute exp(x - max) and accumulate sum
+//   3. Normalize by dividing by sum
+//
+// WHY THREE PASSES:
+// Standard softmax requires computing exp() for all elements before we know the sum.
+// We can't normalize until we have the sum, hence the three-pass structure.
+//
+// PARALLELIZATION:
+// - Launch N threads (one per row)
+// - Each thread processes C elements independently
+// - No inter-thread communication needed
+//
+// MEMORY ACCESS PATTERN:
+// - Each row read 3 times, written 2 times
+// - Sequential access within each thread (good cache locality)
+// - Different rows accessed by different threads (fully parallel)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Poor when N is small (e.g., N=8*1024=8192 vs millions of CUDA cores)
+// - Memory bandwidth: Moderate (multiple passes over same data)
+// - Best for: Very small datasets or educational purposes
+// - Limitation: Severely underutilizes GPU when batch size is small
+//
+// NUMERICAL STABILITY:
+// - Uses double precision for sum accumulation (more accurate than float)
+// - Subtracts max before exp to prevent overflow (exp(800) would overflow float32)
+// - This is the standard numerically stable softmax formulation
+//
 __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
@@ -121,6 +208,47 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
     }
 }
 
+// KERNEL 2: Block-based softmax with shared memory reductions
+//
+// ALGORITHM:
+// - One block per row (N blocks total)
+// - All threads in block cooperate to process one row
+// - Uses tree reduction in shared memory to find max and sum
+//
+// OPTIMIZATION TECHNIQUE - THREAD COARSENING + TREE REDUCTION:
+// Thread coarsening: Each thread processes multiple elements (stride through row)
+//   - Example: If C=1024 and block_size=256, each thread handles 4 elements
+//   - This amortizes thread overhead and improves memory bandwidth
+//
+// Tree reduction: Parallel reduction using shared memory
+//   - Step 1: Each thread writes partial result to shared memory
+//   - Step 2: Threads combine results in a tree pattern (stride /= 2 each iteration)
+//   - Example: 256 threads → 128 → 64 → 32 → 16 → 8 → 4 → 2 → 1
+//   - O(log block_size) steps instead of O(C) serial steps
+//
+// PARALLELIZATION:
+// - Launch N blocks (one per row)
+// - Each block has block_size threads (typically 128-512)
+// - Threads cooperate using shared memory and __syncthreads()
+//
+// MEMORY ACCESS PATTERN:
+// - Global memory: Thread coarsening creates strided access (tid, tid+block_size, ...)
+// - Shared memory: Tree reduction has bank conflicts but acceptable
+// - Fewer global memory reads than kernel1 due to cooperation
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Better than kernel1 (block_size * N threads vs just N threads)
+// - Shared memory usage: block_size floats per block
+// - Synchronization: Multiple __syncthreads() barriers (adds latency)
+// - Best for: Medium C (hundreds to thousands)
+// - Speedup vs kernel1: 2-5x depending on C and block_size
+//
+// SHARED MEMORY REUSE:
+// The same shared memory array is reused for:
+// 1. Max reduction
+// 2. Sum reduction
+// This saves shared memory (limited resource: typically 48KB per SM)
+//
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // in each row of C elements, first calculates maxval, then returns expf(val - maxval)
@@ -218,6 +346,53 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
     }
 }
 
+// KERNEL 4: Hybrid warp + block-level reductions (most versatile and efficient)
+//
+// ALGORITHM:
+// - Combines warp shuffle instructions (fast) with shared memory (flexible)
+// - Two-level reduction: intra-warp (shuffle) then inter-warp (shared memory)
+// - Works with any block_size that's a multiple of 32
+//
+// OPTIMIZATION TECHNIQUE - WARP SHUFFLE INSTRUCTIONS:
+// Modern GPUs have hardware support for communication within a warp (32 threads):
+// - __shfl_down_sync(): Thread can read another thread's register directly
+// - No shared memory needed (faster, lower latency)
+// - Example: warpReduceMax() uses shuffle to find max across 32 threads in O(log 32) = 5 steps
+//
+// TWO-LEVEL REDUCTION STRATEGY:
+// Level 1 (Intra-warp): Use fast warp shuffles
+//   - Each warp (32 threads) reduces to 1 value
+//   - No shared memory, no __syncthreads()
+//   - Very fast: ~5 instructions for complete reduction
+//
+// Level 2 (Inter-warp): Use shared memory
+//   - Lane 0 of each warp writes its result to shared memory
+//   - Thread 0 reads all warp results and computes final value
+//   - Only warpsPerBlock values in shared memory (typically 4-32)
+//
+// PARALLELIZATION:
+// - One block per row (N blocks)
+// - Any block_size that's multiple of 32 (typically 128, 256, 512)
+// - Example: block_size=256 means 8 warps per block
+//
+// MEMORY ACCESS PATTERN:
+// - Global: Thread coarsening (stride through row)
+// - Shared: Minimal usage (only warpsPerBlock floats, e.g., 8 floats for block_size=256)
+// - Register: Warp shuffles operate on registers (fastest memory tier)
+//
+// PERFORMANCE CHARACTERISTICS:
+// - GPU utilization: Excellent (block_size * N threads)
+// - Latency: Lower than kernel2 (warp shuffles are faster than shared memory)
+// - Shared memory usage: Minimal (2 * warpsPerBlock floats)
+// - Flexibility: Works with any reasonable block_size
+// - Best for: Most production use cases
+// - This is typically the fastest general-purpose softmax kernel
+//
+// WHY THIS IS FASTER THAN KERNEL 2:
+// 1. Warp shuffles have ~1 cycle latency vs shared memory's ~20-30 cycles
+// 2. Less shared memory = less bank conflicts
+// 3. Fewer __syncthreads() barriers
+//
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel3, but can handle any block size (multiple of 32)

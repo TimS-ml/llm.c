@@ -1,15 +1,56 @@
 """
-Script to convert GPT2 models from llm.c binary format to Hugging Face
+GPT-2 Model Converter: llm.c Binary Format to HuggingFace
 
-It can optinally upload to your account on Hugging Face if you have the CLI:
-  pip install -U "huggingface_hub[cli]"
-  huggingface-cli login
+This script converts GPT-2 models from the llm.c binary checkpoint format to
+HuggingFace Transformers format. This enables using llm.c-trained models with
+the HuggingFace ecosystem for inference, fine-tuning, or deployment.
 
-Export to a local HF model:
-  python export_hf.py --input input_file.bin --output output_dir
+The converter handles two binary formats:
+- Version 3: float32 weights with padded vocabulary
+- Version 5: bfloat16 weights with padded vocabulary
 
-Export to a local HF model and also push to your account on Hugging Face:
-  python export_hf.py --input input_file.bin --output output_dir --push true
+Features:
+- Converts model weights and configuration
+- Includes GPT-2 tokenizer
+- Optionally uploads to HuggingFace Hub
+- Validates model by running a test generation
+
+Binary Format (llm.c):
+    Header (1024 bytes): Configuration parameters
+    Weights: Model parameters in specific order
+
+Output Format (HuggingFace):
+    - config.json: Model configuration
+    - model.safetensors: Model weights
+    - tokenizer files: Vocabulary and special tokens
+
+Setup:
+    # Install HuggingFace Hub CLI (optional, for uploading)
+    pip install -U "huggingface_hub[cli]"
+    huggingface-cli login
+
+Usage Examples:
+    # Basic conversion to local directory
+    python export_hf.py --input gpt2_124M.bin --output gpt2-124M-hf
+
+    # Convert and upload to HuggingFace Hub
+    python export_hf.py --input gpt2_124M.bin --output myusername/gpt2-124M \\
+        --push true
+
+    # Convert to bfloat16 format
+    python export_hf.py --input gpt2_124M.bin --output gpt2-124M-bf16 \\
+        --dtype bfloat16
+
+    # Skip test generation
+    python export_hf.py --input gpt2_124M.bin --output gpt2-124M-hf \\
+        --spin false
+
+Command-Line Arguments:
+    --input, -i: Path to llm.c binary file (required)
+    --output, -o: HuggingFace model output directory (required)
+    --dtype, -d: Output precision (float32 or bfloat16), default: bfloat16
+    --push, -p: Upload to HuggingFace Hub (true/false), default: false
+    --spin, -s: Run test generation (true/false), default: true
 """
 
 import numpy as np
@@ -22,11 +63,36 @@ from transformers import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
 # Both return float32 tensors
 
 def tensor_bf16(data_int16, transpose=False):
+    """
+    Convert bfloat16 data (stored as int16) to float32 tensor.
+
+    Since numpy doesn't support bfloat16, it's stored as int16 in the binary
+    file. This function reinterprets those bytes as bfloat16 and converts to
+    float32 for use with HuggingFace models.
+
+    Args:
+        data_int16 (np.ndarray): Array of int16 values representing bfloat16 data
+        transpose (bool): If True, transpose the array before conversion.
+            Needed for Conv1D->Linear weight compatibility. Default: False
+
+    Returns:
+        torch.Tensor: Float32 tensor with the same values
+    """
     if transpose:
         data_int16 = data_int16.transpose(1,0)
     return torch.tensor(data_int16).view(torch.bfloat16).to(torch.float32)
 
 def tensor_fp32(data_float32, transpose=False):
+    """
+    Convert float32 numpy array to float32 PyTorch tensor.
+
+    Args:
+        data_float32 (np.ndarray): Float32 numpy array
+        transpose (bool): If True, transpose before converting. Default: False
+
+    Returns:
+        torch.Tensor: Float32 tensor
+    """
     if transpose:
         data_float32 = data_float32.transpose(1,0)
     return torch.tensor(data_float32).view(torch.float32)
@@ -35,6 +101,44 @@ def tensor_fp32(data_float32, transpose=False):
 # Main conversion function
 
 def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
+    """
+    Convert a GPT-2 model from llm.c binary format to HuggingFace format.
+
+    This function reads a binary checkpoint file created by train_gpt2.py, extracts
+    the model configuration and weights, and saves them in HuggingFace Transformers
+    format. The output can be used with the HuggingFace ecosystem or uploaded to
+    the HuggingFace Hub.
+
+    Binary File Format (llm.c):
+        Header (1024 bytes): 256 int32 values
+            [0]: Magic number (20240326)
+            [1]: Version (3=float32, 5=bfloat16)
+            [2]: block_size (max sequence length)
+            [3]: vocab_size (actual vocabulary size, e.g., 50257)
+            [4]: n_layer (number of transformer blocks)
+            [5]: n_head (number of attention heads)
+            [6]: n_embd (embedding dimension)
+            [7]: padded_vocab_size (vocab size rounded to multiple, e.g., 50304)
+        Weights: All parameters in predetermined order
+
+    Args:
+        filepath (str): Path to llm.c binary checkpoint file
+        output (str): Output directory or HuggingFace Hub model ID
+            (e.g., "myusername/my-model")
+        push_to_hub (bool): If True, upload to HuggingFace Hub after saving
+            locally. Requires authentication via huggingface-cli login. Default: False
+        out_dtype (str): Output precision for HuggingFace model.
+            Options: "float32" or "bfloat16". Default: "bfloat16"
+
+    Raises:
+        SystemExit: If magic number or version is invalid
+        ValueError: If out_dtype is not "float32" or "bfloat16"
+
+    Notes:
+        - Automatically handles vocabulary padding (llm.c pads to multiples of 128)
+        - Handles weight transposition for Conv1D layers
+        - Includes GPT-2 tokenizer from HuggingFace
+    """
     print(f"Converting model {filepath} to {output} in {out_dtype} format and pushing to Hugging Face: {push_to_hub}")
 
     f = open(filepath, 'rb')
@@ -144,16 +248,48 @@ def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
         tokenizer.push_to_hub(output)
 
 def spin(output):
+    """
+    Test the converted model by generating sample text.
+
+    This function loads the converted HuggingFace model and runs a test
+    generation to verify the conversion was successful. It uses a simple
+    prompt and generates 64 tokens.
+
+    Args:
+        output (str): Path to the converted HuggingFace model directory
+
+    Test Configuration:
+        - Prompt: "During photosynthesis in green plants"
+        - Max tokens: 64
+        - Repetition penalty: 1.3
+        - Uses Flash Attention 2 if available
+        - Runs on CUDA if available
+
+    Output:
+        Prints the generated text to console
+
+    Note:
+        Requires transformers library with Flash Attention 2 support.
+        Falls back to standard attention if Flash Attention is unavailable.
+    """
     print("Taking the exported model for a spin...")
     print('-'*80)
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # Load tokenizer and model from the converted directory
     tokenizer = AutoTokenizer.from_pretrained(output)
     model = AutoModelForCausalLM.from_pretrained(output, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, device_map='cuda')
     model.eval()
+
+    # Prepare test prompt
     tokens = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
     tokens = tokens.to('cuda')
+
+    # Generate continuation
     output = model.generate(tokens, max_new_tokens=64, repetition_penalty=1.3)
     samples = tokenizer.batch_decode(output)
+
+    # Print results
     for sample in samples:
         print('-'*30)
         print(sample)

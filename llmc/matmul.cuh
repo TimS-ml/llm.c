@@ -1,5 +1,182 @@
 /*
-Matrix Multiplication, with help from cuBLASLt
+==============================================================================
+Matrix Multiplication Layer
+==============================================================================
+
+PURPOSE:
+Implements matrix multiplication operations for transformer models using
+NVIDIA's cuBLASLt library for high-performance GEMM (General Matrix Multiply).
+Also includes custom CUDA kernels for bias gradient computation.
+
+MATHEMATICAL OPERATION:
+General form: D = alpha * op(A) @ op(B) + beta * C + bias
+
+Where:
+- A, B are input matrices
+- op(X) is either X or X^T (transpose)
+- C is optional input for accumulation
+- bias is optional bias vector added to each row
+- alpha, beta are scalars (typically alpha=1, beta=0 or 1)
+
+Common patterns in transformers:
+1. Forward: out = W^T @ inp + bias    [Linear layer]
+2. Backward to input: dinp = W @ dout  [No transpose]
+3. Backward to weight: dW += inp @ dout^T  [Accumulate with beta=1]
+
+CUBLAS LIBRARY USAGE:
+
+cuBLASLt (CUDA Basic Linear Algebra Subroutines - Light) is NVIDIA's
+high-performance GEMM library that provides:
+- Tensor Core acceleration on modern GPUs (Volta, Turing, Ampere, Hopper)
+- Support for mixed-precision computation (FP32, FP16, BF16, FP8)
+- Fused operations (GEMM + bias, GEMM + GELU, etc.)
+- Automatic kernel selection via heuristics
+
+MATRIX LAYOUTS AND TRANSPOSES:
+
+cuBLASLt supports row-major and column-major layouts. This implementation:
+- Uses column-major (Fortran-style) internally
+- transA=true means first matrix (A) is transposed
+- transB=true means second matrix (B) is transposed
+
+For C = A @ B where A is (m, k) and B is (k, n):
+- If transA=true: A stored as (k, m), logically accessed as (m, k)
+- If transB=true: B stored as (n, k), logically accessed as (k, n)
+- Output D is always stored as (m, n)
+
+Batch operations: Process multiple independent matrix multiplications
+- batch_count: Number of matrices in the batch
+- strideA, strideB, strideOut: Memory offset between consecutive matrices
+- Used for attention (B*NH batches, one per head)
+
+FUSED OPERATIONS:
+
+1. Bias addition (CUBLAS_EPILOGUE_BIAS):
+   out = matmul(A, B) + bias
+   Saves memory bandwidth by fusing bias add into GEMM kernel
+
+2. GELU activation (CUBLASLT_EPILOGUE_GELU_AUX):
+   out = GELU(matmul(A, B) + bias)
+   pre_gelu = matmul(A, B) + bias  [saved for backward pass]
+   Highly efficient on H100+ GPUs
+
+3. GELU backward (CUBLASLT_EPILOGUE_DGELU):
+   out = matmul(A, B) * GELU'(pre_gelu)
+   Backpropagates through GELU using saved pre-activation
+
+4. Bias gradient (CUBLASLT_EPILOGUE_BGRADB):
+   Computes dbias during backward pass
+
+BIAS GRADIENT COMPUTATION:
+
+matmul_backward_bias_kernel9 is a custom kernel for computing bias gradients:
+
+Given dout of shape (B*T, OC), compute:
+  dbias[oc] = sum_{bt}(dout[bt, oc])
+
+Algorithm:
+- Each block processes OC_per_warp channels (64 at BF16)
+- Grid dimensions: (grid_size_x, grid_size_y)
+  * grid_size_x: Number of channel groups
+  * grid_size_y: Parallelism across batch dimension
+- Each thread accumulates x128::size elements
+- Intra-warp reduction using shuffle instructions
+- Block-wide reduction using shared memory
+
+Two modes:
+1. Direct write (grid_size_y == 1):
+   Write results directly to dbias (single kernel)
+
+2. Two-stage reduction (grid_size_y > 1):
+   Stage 1: Each block writes partial sums to dbias_buffer
+   Stage 2: reduce_add_sum_kernel sums across blocks
+
+FORWARD PASS (matmul_forward_cublaslt):
+  out = W^T @ inp + bias
+
+Parameters:
+- inp: (B*T, C) - input activations
+- weight: (C, OC) - weight matrix
+- bias: (OC,) - optional bias vector
+- out: (B*T, OC) - output activations
+- pre_gelu: (B*T, OC) - optional storage for pre-GELU values
+
+GELU fusion controlled by gelu_fusion parameter:
+- gelu_fusion < 1: Separate GEMM + GELU kernels
+- gelu_fusion >= 1: Fused GEMM+GELU (H100+ recommended)
+
+BACKWARD PASS (matmul_backward):
+
+Three gradients to compute:
+1. Gradient w.r.t. input (dinp):
+   dinp = W @ dout
+   Uses = assignment (overwrites, doesn't accumulate)
+
+2. Gradient w.r.t. weight (dweight):
+   dweight += inp^T @ dout
+   Uses += (accumulates across batches and gradient checkpointing)
+
+3. Gradient w.r.t. bias (dbias):
+   dbias += sum_batch(dout)
+   Custom kernel or cuBLASLt epilogue
+
+GELU backward:
+- If gelu_fusion >= 2: Fused into matmul (dinp computation)
+- If gelu_fusion < 2: Separate gelu_backward_inplace call
+
+MEMORY ACCESS PATTERNS:
+- GEMM operations: Highly optimized by cuBLASLt
+  * Tensor Core usage on modern GPUs
+  * Tiled algorithms minimize DRAM access
+  * Shared memory for data reuse
+- Bias kernel: Coalesced reads from dout, scattered atomic updates
+  (avoided by using two-stage reduction)
+
+OPTIMIZATION TECHNIQUES:
+
+1. Alignment enforcement:
+   All pointers must be 16-byte aligned for optimal performance
+   (enables vectorized loads/stores)
+
+2. Algorithm selection:
+   cuBLASLt uses heuristics to select the best kernel based on:
+   - Matrix dimensions (m, n, k)
+   - Data types (FP32, BF16, FP8)
+   - Transpose flags
+   - Epilogue operations
+
+3. Workspace memory:
+   cublaslt_workspace provides scratch space for algorithms
+   that need temporary storage
+
+4. Precision handling:
+   - Computation in FP32 (high precision)
+   - Inputs/outputs in floatX (BF16/FP8 for memory efficiency)
+   - Scale type always FP32
+
+5. Batched operations:
+   Single kernel launch for B*NH matrix multiplications
+   (attention heads) instead of B*NH separate calls
+
+PERFORMANCE CONSIDERATIONS:
+- GEMM is compute-bound on modern GPUs with Tensor Cores
+- Achieves up to 95%+ of theoretical peak FLOPS on large matrices
+- Fusion reduces memory traffic:
+  * GEMM+bias: Saves one pass over output
+  * GEMM+GELU: Saves two passes (one for GELU, one for pre_gelu)
+- Bias gradient kernel memory-bound but well-optimized
+- Two-stage reduction for bias avoids atomic contention
+
+TENSOR CORE UTILIZATION:
+- FP16/BF16: Uses TF32 Tensor Cores (Ampere+) or FP16 Tensor Cores (Volta+)
+- FP8: Uses FP8 Tensor Cores (Hopper H100+)
+- Requires properly aligned data and specific tile sizes
+- cuBLASLt handles these requirements automatically
+
+REFERENCES:
+- cuBLASLt documentation: https://docs.nvidia.com/cuda/cublas/
+- Mixed Precision Training (Micikevicius et al., 2017): https://arxiv.org/abs/1710.03740
+- NVIDIA Tensor Core Programming Guide
 */
 #include <assert.h>
 #include <type_traits>      // std::bool_constant

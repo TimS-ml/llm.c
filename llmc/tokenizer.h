@@ -1,9 +1,42 @@
 /*
-Defines the GPT-2 Tokenizer.
-Only supports decoding, i.e.: tokens (integers) -> strings
-This is all we need for unconditional generation.
-If we wanted to later prompt the model, we'd have to add decoding.
-Which could be tricky in C because of the regex involved, to look into later.
+================================================================================
+File: tokenizer.h
+Purpose: GPT-2 BPE tokenizer (decode-only) for text generation
+================================================================================
+
+Overview:
+---------
+This file implements a minimal GPT-2 tokenizer that supports ONLY decoding
+(converting token IDs back to text). This is sufficient for unconditional
+generation where the model produces tokens and we need to display the result.
+
+Why Decode-Only?
+---------------
+- Encoding (text -> tokens) requires complex regex for byte-pair merging
+- Decoding (tokens -> text) is simple: just table lookup
+- For generation, we only need decoding (model outputs tokens, we display text)
+- If prompting is needed later, encoding would need to be implemented
+
+Tokenization Basics:
+-------------------
+GPT-2 uses Byte-Pair Encoding (BPE):
+- Vocabulary: ~50K tokens (subword units)
+- Each token maps to a byte sequence
+- <|endoftext|> is a special token marking document boundaries
+
+File Format:
+-----------
+The tokenizer file (.bin) contains:
+- Header: [magic, version, vocab_size, eot_token]
+- Token table: [length, bytes] for each token
+
+Usage:
+------
+    Tokenizer tok;
+    tokenizer_init(&tok, "gpt2_tokenizer.bin");
+    const char* text = tokenizer_decode(&tok, token_id);
+    safe_printf(text);  // Print token (handles unprintable characters)
+    tokenizer_free(&tok);
 */
 
 #include <stdint.h>
@@ -13,8 +46,18 @@ Which could be tricky in C because of the regex involved, to look into later.
 // defines fopenCheck, freadCheck, fcloseCheck, fseekCheck, mallocCheck
 #include "utils.h"
 
-// ----------------------------------------------------------------------------
+// ============================================================================
+// TOKENIZER DATA STRUCTURE
+// ============================================================================
 
+/**
+ * Tokenizer - GPT-2 tokenizer state
+ *
+ * @field vocab_size: Number of tokens in vocabulary (~50257 for GPT-2)
+ * @field token_table: Array of strings, one per token ID
+ * @field init_ok: 1 if successfully initialized, 0 if init failed
+ * @field eot_token: ID of the <|endoftext|> token (usually 50256)
+ */
 typedef struct {
     uint32_t vocab_size;
     char **token_table;
@@ -22,6 +65,21 @@ typedef struct {
     int eot_token; // <|endoftext|> token id
 } Tokenizer;
 
+/**
+ * safe_printf - Prints a token string, filtering out unprintable characters
+ *
+ * @param piece: Token string to print
+ *
+ * Many tokens represent raw bytes including control codes, backspace, etc.
+ * This function only prints tokens that are:
+ * - Printable (isprint returns true)
+ * - Whitespace (isspace returns true)
+ *
+ * Single-byte tokens are checked more carefully since they might be
+ * control codes. Multi-byte tokens are printed as-is.
+ *
+ * This prevents terminal corruption when displaying generated text.
+ */
 void safe_printf(const char *piece) {
     // the tokens are raw bytes, and we we only want to print the printable ones
     // many bytes can be various control codes, backspace, etc.
@@ -38,6 +96,28 @@ void safe_printf(const char *piece) {
     printf("%s", piece);
 }
 
+/**
+ * tokenizer_init - Loads tokenizer from a binary file
+ *
+ * @param tokenizer: Tokenizer struct to initialize
+ * @param filename: Path to tokenizer file (.bin)
+ *
+ * File format:
+ * - Header (256 uint32_t):
+ *   [0]: Magic number (20240328)
+ *   [1]: Version (1 or 2)
+ *   [2]: Vocabulary size
+ *   [3]: EOT token ID (only in version 2)
+ * - For each token:
+ *   - 1 byte: String length
+ *   - N bytes: Token bytes
+ *
+ * Version differences:
+ * - Version 1: EOT token assumed to be 50256 (GPT-2 default)
+ * - Version 2: EOT token ID stored in header[3]
+ *
+ * If file cannot be opened or is invalid, sets init_ok=0 and prints warnings.
+ */
 void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     FILE *file = fopen(filename, "rb");
     if (file == NULL) {
@@ -83,6 +163,16 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     tokenizer->init_ok = 1;
 }
 
+/**
+ * tokenizer_decode - Converts a token ID to its string representation
+ *
+ * @param tokenizer: Initialized tokenizer
+ * @param token_id: Token ID to decode
+ * @return: Pointer to token string, or NULL if tokenizer not initialized or invalid ID
+ *
+ * Simple table lookup: token_table[token_id].
+ * Returns NULL for out-of-range token IDs.
+ */
 const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
     if (tokenizer->init_ok == 0) {
         return NULL;
@@ -95,6 +185,15 @@ const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
     }
 }
 
+/**
+ * tokenizer_free - Frees all memory allocated by the tokenizer
+ *
+ * @param tokenizer: Tokenizer to free
+ *
+ * Frees:
+ * - Each token string
+ * - The token table array
+ */
 void tokenizer_free(Tokenizer *tokenizer) {
     if (tokenizer->init_ok) {
         for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {

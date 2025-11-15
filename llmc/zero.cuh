@@ -1,5 +1,226 @@
 /*
-Utilities for ZeRO sharding
+==============================================================================
+ZeRO (Zero Redundancy Optimizer) - Multi-GPU Training Utilities
+==============================================================================
+
+PURPOSE:
+Implements ZeRO optimization strategies for distributed training across
+multiple GPUs. ZeRO reduces memory redundancy by partitioning optimizer
+states, gradients, and parameters across GPUs while maintaining computational
+efficiency.
+
+ZERO OPTIMIZATION STAGES:
+
+Stage 0 (Disabled - Baseline Data Parallel):
+- Each GPU maintains full copy of: parameters, gradients, optimizer states
+- All-reduce gradients after backward pass
+- Memory: O(Ψ + K*Ψ) per GPU where Ψ = model size, K = optimizer state factor
+- Memory redundancy: N×
+- Communication: All-reduce gradients (bandwidth-optimal)
+
+Stage 1 (Optimizer State Sharding - OSS):
+- Each GPU maintains full copy of: parameters, gradients
+- Optimizer states (m, v, master weights) partitioned across GPUs
+- Each GPU only updates its partition of parameters
+- All-gather parameters after update (if needed)
+- Memory: O(Ψ + Ψ/N + K*Ψ/N) ≈ O(Ψ) for large K
+- Memory saved: ~4× for AdamW (K=2) + master weights
+- Communication: Reduce-scatter gradients + all-gather parameters
+
+Stage 2 (Gradient Sharding - SDP):
+- Each GPU maintains full copy of: parameters
+- Gradients + optimizer states partitioned across GPUs
+- Reduce-scatter gradients to owner GPU during backward
+- Memory: O(Ψ + Ψ/N + K*Ψ/N)
+- Memory saved: ~8× for AdamW
+- Communication: Reduce-scatter gradients (more efficient than stage 1)
+
+Stage 3 (Parameter Sharding - FSDP):
+- Parameters + gradients + optimizer states all partitioned
+- All-gather parameters just-in-time for forward/backward
+- Discard non-owned parameters after use
+- Memory: O(Ψ/N + Ψ/N + K*Ψ/N) = O((K+2)*Ψ/N)
+- Memory saved: ~N× total
+- Communication: All-gather parameters (2× for forward + backward)
+- Trade-off: More communication for extreme memory savings
+
+This implementation currently supports Stages 0 and 1.
+
+MULTI-GPU CONFIGURATION (MultiGpuConfig):
+
+Key fields:
+- process_rank: Rank of this process (0 to num_processes-1)
+- num_processes: Total number of GPUs/processes
+- local_device_idx: GPU index on this machine (for multi-node)
+- zero_stage: Which ZeRO optimization level (0, 1, 2, 3)
+- shard_num_parameters: Number of parameters this GPU owns
+- nccl_comm: NCCL communicator for collective operations
+- nccl_stream: Dedicated CUDA stream for NCCL operations
+- compute_nccl_sync: Event for synchronizing compute and NCCL streams
+
+NCCL (NVIDIA Collective Communications Library):
+
+NCCL provides optimized multi-GPU communication primitives:
+
+1. All-Reduce:
+   All GPUs contribute data, all receive the reduced result
+   Result[i] = sum_gpu(Input_gpu[i])
+   Used in Stage 0 for gradient averaging
+
+2. Reduce-Scatter:
+   All GPUs contribute data, each receives a partition of reduced result
+   GPU_k receives: sum_gpu(Input_gpu[k*chunk_size : (k+1)*chunk_size])
+   Used in Stage 1 for gradient reduction with partitioning
+
+3. All-Gather:
+   Each GPU contributes a partition, all receive the full concatenated result
+   Inverse of reduce-scatter
+   Used to reconstruct full parameters from sharded optimizer state
+
+4. Broadcast:
+   One GPU sends data to all others
+   Used for distributing random seeds, configuration, etc.
+
+NCCL INITIALIZATION METHODS:
+
+Three methods for initializing NCCL across machines:
+
+1. MPI (Message Passing Interface):
+   - Requires MPI installation and PMIx support
+   - Rank 0 generates NCCL unique ID
+   - MPI_Bcast distributes ID to all ranks
+   - Most reliable for HPC clusters
+   - Requires --use-mpi flag
+
+2. TCP (Socket-based):
+   - Rank 0 creates TCP server on specified IP/port (12345)
+   - Other ranks connect as TCP clients
+   - Server sends NCCL unique ID to all clients
+   - Works across machines with network connectivity
+   - Requires --server-ip flag
+
+3. Filesystem (Shared FS):
+   - Rank 0 writes NCCL unique ID to shared file
+   - Other ranks poll until file appears, then read ID
+   - Requires shared filesystem (NFS, Lustre, etc.)
+   - Simplest but has race conditions (naive sleep-based sync)
+   - Requires --fs-path flag
+
+LOCAL DEVICE SELECTION (multi_gpu_get_local_device_idx):
+
+For multi-node training, determines which GPU on each machine:
+- Hash hostname to identify machine
+- All-gather hostnames from all processes
+- Count processes on same machine before this rank
+- This count becomes local_device_idx
+
+Example: 4 processes on 2 machines (2 GPUs each):
+- Machine A: Rank 0 (GPU 0), Rank 1 (GPU 1)
+- Machine B: Rank 2 (GPU 0), Rank 3 (GPU 1)
+
+GRADIENT REDUCTION (multi_gpu_async_reduce_gradient):
+
+Template function that reduces gradients across GPUs:
+
+Parameters:
+- pointers[N]: Array of gradient buffer pointers
+- pointers_sizes[N]: Size of each buffer
+- config: Multi-GPU configuration
+- compute_stream: CUDA stream for computation
+
+Algorithm:
+1. Record event on compute stream (marks completion of backward pass)
+2. Wait for event on NCCL stream (ensures gradients are ready)
+3. Launch NCCL group (batches multiple operations):
+   - Stage 0: ncclAllReduce with ncclAvg (average gradients)
+   - Stage 1: ncclReduceScatter with ncclAvg (partition + average)
+4. NCCL operations run asynchronously on nccl_stream
+
+Advantages:
+- Asynchronous: Doesn't block CPU or compute stream
+- Overlapping: Communication can overlap with next forward pass
+- Batching: Multiple gradients in single NCCL group (more efficient)
+- Deterministic: No race conditions or atomics
+
+SHARDING UTILITIES (multi_gpu_get_shard_offset):
+
+Computes which partition of a tensor this GPU owns:
+
+Given tensor with 'elements' and zero_stage:
+- If zero_stage >= shard_at_stage: Return this GPU's partition
+  * offset = rank * (elements / num_processes)
+  * size = elements / num_processes
+- Otherwise: Return full tensor (no sharding at this stage)
+
+Example: 1000 parameters, 4 GPUs, Stage 1:
+- GPU 0: offset=0, size=250 (elements 0-249)
+- GPU 1: offset=250, size=250 (elements 250-499)
+- GPU 2: offset=500, size=250 (elements 500-749)
+- GPU 3: offset=750, size=250 (elements 750-999)
+
+SYNCHRONIZATION (multi_gpu_barrier):
+
+Ensures all GPUs reach the same point before continuing:
+- Uses ncclAllReduce on a dummy buffer
+- Synchronizes both NCCL and CUDA streams
+- Used for checkpointing, validation, etc.
+
+MEMORY AND COMMUNICATION COSTS:
+
+For model with Ψ parameters on N GPUs:
+
+Stage 0 (Data Parallel):
+- Memory per GPU: 4Ψ (FP32) or 2Ψ (BF16) params
+                + 12Ψ (FP32) optimizer state
+                = ~16Ψ bytes total
+- Communication: 2Ψ per step (all-reduce gradients)
+
+Stage 1 (Optimizer Sharding):
+- Memory per GPU: 2Ψ params + 12Ψ/N optimizer state
+                ≈ 2Ψ + 12Ψ/N bytes (4× savings for N=4)
+- Communication: 2Ψ per step (reduce-scatter gradients)
+
+Stage 2 (Gradient Sharding):
+- Memory per GPU: 2Ψ params + 2Ψ/N gradients + 12Ψ/N optimizer
+                ≈ 2Ψ + 14Ψ/N bytes
+- Communication: 2Ψ per step (reduce-scatter)
+
+Stage 3 (Full Sharding):
+- Memory per GPU: 14Ψ/N bytes (N× savings!)
+- Communication: 4Ψ per step (2× all-gather for forward+backward)
+
+PERFORMANCE CONSIDERATIONS:
+
+1. Network Bandwidth:
+   - NVLink: 300-600 GB/s (intra-node)
+   - InfiniBand: 100-200 GB/s (inter-node)
+   - Ethernet: 10-100 GB/s (slower)
+   - Stage 1/2 preferred for fast interconnects
+   - Stage 3 only for extreme memory constraints
+
+2. Overlap Opportunities:
+   - Gradients reduced as soon as computed (layer-by-layer)
+   - Next forward pass can start while reduction ongoing
+   - ~30-50% communication hiding possible
+
+3. Scaling Efficiency:
+   - Stage 0/1: Near-linear scaling up to bandwidth limit
+   - Stage 2: Good scaling with fast interconnect
+   - Stage 3: Communication overhead limits scaling
+
+IMPLEMENTATION NOTES:
+
+- Uses CUDA events (not cudaStreamSynchronize) to avoid CPU/GPU sync
+- NCCL operations are asynchronous (return immediately)
+- Template functions for compile-time size checking (safety)
+- printf0 macro: Only rank 0 prints (avoids duplicate output)
+
+REFERENCES:
+- ZeRO: Memory Optimizations Toward Training Trillion Parameter Models
+  (Rajbhandari et al., 2019): https://arxiv.org/abs/1910.02054
+- NCCL Documentation: https://docs.nvidia.com/deeplearning/nccl/
+- PyTorch FSDP: https://pytorch.org/docs/stable/fsdp.html
+- DeepSpeed ZeRO: https://www.deepspeed.ai/tutorials/zero/
 */
 
 #ifndef LLMC_ZERO_CUH
